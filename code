@@ -4294,6 +4294,4243 @@ if __name__ == "__main__":
 ###################################
 
 
+
+"""
+Main application window
+"""
+from datetime import datetime
+from pathlib import Path
+import traceback
+from venv import logger
+import customtkinter as ctk
+from tkinter import messagebox
+from typing import List, Optional, Tuple, Dict
+from localvm.config import config
+from localvm.database import DatabaseManager
+from localvm.deployment_engine import DeploymentEngine
+from localvm.gui.credentials_dialog import CredentialsDialog
+from localvm.gui.deployment_dialog import DeploymentDialog
+from localvm.gui.firewall_dialog import FirewallDialog
+from localvm.gui.australia_ip_dialog import AustraliaIPDialog
+from localvm.gui.file_manager_dialog import FileManagerDialog
+from localvm.gui.vm_dialog import VMDialog
+from localvm.gui.terminal_widget import TerminalWidget
+from localvm.gui.theme_manager import ThemeManager
+from localvm.gui.widgets import ModernButton, CardFrame, StatusBadge
+from localvm.ngfw_manager import NextGenFirewall
+from localvm.version_manager import VersionManager
+from localvm.vm_manager import VirtualMachineManager
+from models.vm_model import VirtualMachine
+from utils.validators import Validators
+from utils.helpers import Helpers
+from localvm.gui.domain_manager_dialog import DomainManagerDialog
+
+# Import new advanced managers
+from localvm.gui.network_manager_dialog import NetworkManagerDialog
+from localvm.gui.database_manager_dialog import DatabaseManagerDialog
+from localvm.gui.api_manager_dialog import APIManagerDialog
+from localvm.gui.dashboard_dialog import SystemDashboardDialog
+
+class MainWindow(ctk.CTk):
+    """Main application window"""
+    
+    def __init__(self):
+        super().__init__()
+        
+         # Initialize components
+        self.config = config
+        self.db = DatabaseManager()
+        self.terminal_widget = None
+        
+        # Check and run version migrations
+        logger.info("Checking for version migrations...")
+        self.version_manager = VersionManager(self.config)
+        if not self.version_manager.check_and_migrate():
+            logger.warning("Version migration check had issues, but continuing...")
+        else:
+            logger.info("Version migration check completed successfully")
+
+        self.deployment_engine = DeploymentEngine(self.db_manager)
+        
+        self.theme_manager = ThemeManager()
+        self.vms: List[VirtualMachine] = []
+        self.ngfw = NextGenFirewall()
+        self.vm_manager = VirtualMachineManager()
+        self.validators = Validators()
+        self.helpers = Helpers()
+        self._check_dependencies()
+        
+        # Initialize notebook and terminal references
+        self.vm_notebook = None
+    
+        
+        self._setup_window()
+        self._setup_ui()
+        self._load_vms()
+        
+        # Advanced managers (lazy loaded)
+        self.network_manager = None
+        self.db_manager = None
+        self.api_manager = None
+
+
+
+        
+    def _setup_window(self):
+        """Configure main window"""
+        self.title(f"{self.config.app_name} v{self.config.app_version}")
+        self.geometry(self.config.window_size)
+        self.minsize(1000, 600)
+        
+        # Set theme
+        ctk.set_appearance_mode(self.theme_manager.current_theme)
+        ctk.set_default_color_theme("blue")
+    
+    def _setup_ui(self):
+        """Setup main UI"""
+        # Configure grid
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        
+        # Sidebar with logo - Use darker base color that works with both themes
+        sidebar_color = self._get_sidebar_color()
+        self.sidebar = CardFrame(self, width=250, fg_color=sidebar_color)
+        self.sidebar.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        
+        # Make sidebar scrollable
+        sidebar_container = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        sidebar_container.pack(fill="both", expand=True)
+        
+        # Create scrollable frame for buttons
+        scrollable_frame = ctk.CTkScrollableFrame(
+            sidebar_container, 
+            fg_color="transparent",
+            scrollbar_button_color=sidebar_color,
+            scrollbar_button_hover_color=sidebar_color
+        )
+        scrollable_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Load logo if exists
+        app_info = self.config.get_app_info()
+        
+        if app_info.get('logo_path') and Path(app_info['logo_path']).exists():
+            try:
+                from PIL import Image
+                
+                # Load and resize logo
+                logo_image = ctk.CTkImage(
+                    light_image=Image.open(app_info['logo_path']),
+                    dark_image=Image.open(app_info['logo_path']),
+                    size=(80, 80)
+                )
+                
+                logo_label = ctk.CTkLabel(
+                    scrollable_frame,
+                    image=logo_image,
+                    text=""
+                )
+                logo_label.pack(pady=(15, 10))
+                
+            except ImportError:
+                # PIL not available, use text logo
+                title = ctk.CTkLabel(
+                    scrollable_frame,
+                    text="LocalVM",
+                    font=("Segoe UI", 24, "bold")
+                )
+                title.pack(pady=(20, 5))
+                
+            except Exception as e:
+                logger.error(f"Error loading logo: {e}")
+                # Fallback to text
+                title = ctk.CTkLabel(
+                    scrollable_frame,
+                    text="LocalVM",
+                    font=("Segoe UI", 24, "bold")
+                )
+                title.pack(pady=(20, 5))
+        else:
+            # Text logo if image not found
+            title = ctk.CTkLabel(
+                scrollable_frame,
+                text="LocalVM",
+                font=("Segoe UI", 24, "bold")
+            )
+            title.pack(pady=(20, 5))
+        
+        # Version info - using version manager
+        from version import get_version_display
+        version_text = get_version_display()
+        
+        version_label = ctk.CTkLabel(
+            scrollable_frame,
+            text=version_text,
+            font=("Segoe UI", 10),
+            text_color="gray"
+        )
+        version_label.pack(pady=(0, 5))
+        
+        # Company name
+        company_label = ctk.CTkLabel(
+            scrollable_frame,
+            text=self.config.company_name,
+            font=("Segoe UI", 11, "italic"),
+            text_color="#60A5FA"
+        )
+        company_label.pack(pady=(0, 30))
+        
+        # Sidebar buttons - Updated with new managers
+        buttons = [
+            ("🏠 Dashboard", self._show_dashboard),
+            ("🖥️ All VMs", self._show_vms),
+            ("🌐 Network Manager", self.open_network_manager),
+            ("🚀 One-Click Deploy", self.open_deployment_manager), 
+            ("🗄️ Database Manager", self.open_database_manager),
+            ("🔌 API Manager", self.open_api_manager),
+            ("📁 File Manager", self._show_file_manager),
+            ("🔥 Firewall", self._show_firewall),
+            ("🌍 Domain Manager", self.open_domain_manager),
+            ("🇦🇺 Australian IPs", self._show_australia_ips),
+            ("📊 System Dashboard", self.open_system_dashboard),
+            ("📋 Logs", self._show_logs), 
+            ("⚙️ Settings", self._show_settings),
+            ("📈 Stats", self._show_stats),
+            ("ℹ️ About", self._show_about), 
+            ("❓ Help", self._show_help)
+        ]
+        
+        # Get button colors based on theme
+        button_colors = self._get_button_colors()
+        
+        for text, command in buttons:
+            btn = ModernButton(
+                scrollable_frame,
+                text=text,
+                command=command,
+                anchor="w",
+                height=40,
+                fg_color=button_colors["normal"],
+                hover_color=button_colors["hover"],
+                text_color=button_colors["text"],
+                border_color=button_colors["border"],
+                border_width=1
+            )
+            btn.pack(fill="x", padx=10, pady=5)
+        
+        # Theme switcher
+        theme_label = ctk.CTkLabel(
+            scrollable_frame,
+            text="Theme:",
+            font=("Segoe UI", 12)
+        )
+        theme_label.pack(anchor="w", padx=10, pady=(30, 5))
+        
+        self.theme_switch = ctk.CTkSegmentedButton(
+            scrollable_frame,
+            values=["🌙 Dark", "☀️ Light", "🖥️ System"],
+            command=self._switch_theme,
+            height=30,
+            fg_color=button_colors["normal"],
+            selected_color=button_colors["selected"],
+            selected_hover_color=button_colors["selected_hover"],
+            unselected_color=button_colors["unselected"],
+            unselected_hover_color=button_colors["unselected_hover"]
+        )
+        self.theme_switch.pack(fill="x", padx=10, pady=(0, 20))
+        self.theme_switch.set("🖥️ System")
+        
+        # Add a spacer at the bottom to ensure scrolling works well
+        ctk.CTkFrame(scrollable_frame, height=20, fg_color="transparent").pack()
+        
+        # Main content area
+        self.main_frame = ctk.CTkFrame(self)
+        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(1, weight=1)
+        
+        # Top bar
+        top_bar = ctk.CTkFrame(self.main_frame, height=50, fg_color="transparent")
+        top_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        top_bar.grid_columnconfigure(1, weight=1)
+        
+        # Welcome label
+        self.welcome_label = ctk.CTkLabel(
+            top_bar,
+            text="Welcome to LocalVM Manager",
+            font=("Segoe UI", 20, "bold")
+        )
+        self.welcome_label.grid(row=0, column=0, sticky="w")
+        
+        # Add VM button
+        self.add_vm_btn = ModernButton(
+            top_bar,
+            text="+ Add VM",
+            command=self._add_vm,
+            width=100,
+            fg_color="#3B82F6",  # Keep this as blue for primary action
+            hover_color="#2563EB"
+        )
+        self.add_vm_btn.grid(row=0, column=1, sticky="e")
+        
+        # Content area
+        self.content_frame = ctk.CTkFrame(self.main_frame)
+        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        
+        # Show dashboard by default
+        self._show_dashboard()
+
+    def open_deployment_manager(self):
+        """Open One-Click Deployment dialog"""
+        try:
+            dialog = DeploymentDialog(self, self.deployment_engine)
+            dialog.grab_set()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open Deployment Manager: {str(e)}")
+
+    def _check_dependencies(self):
+        """Check for required Python dependencies"""
+        missing_deps = []
+        
+        # Check for psutil
+        try:
+            import psutil
+        except ImportError:
+            missing_deps.append("psutil")
+        
+        if missing_deps:
+            # Show warning but don't block startup
+            logger.warning(f"Missing dependencies: {', '.join(missing_deps)}")
+            
+            # Ask user if they want to install missing dependencies
+            response = messagebox.askyesno(
+                "Missing Dependencies",
+                f"The following packages are missing:\n\n"
+                f"{', '.join(missing_deps)}\n\n"
+                "Would you like to install them now?",
+                parent=self
+            )
+            
+            if response:
+                self._install_dependencies(missing_deps)
+
+    def _install_dependencies(self, packages):
+        """Install missing dependencies"""
+        try:
+            import subprocess
+            import sys
+            
+            # Install each missing package
+            for package in packages:
+                logger.info(f"Installing {package}...")
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install", package
+                ])
+            
+            messagebox.showinfo(
+                "Dependencies Installed",
+                "Dependencies installed successfully. Please restart the application.",
+                parent=self
+            )
+            
+            # Close the application
+            self.quit()
+            
+        except Exception as e:
+            logger.error(f"Failed to install dependencies: {e}")
+            messagebox.showerror(
+                "Installation Failed",
+                f"Failed to install dependencies:\n\n{str(e)}",
+                parent=self
+            )
+
+
+    def _get_sidebar_color(self):
+        """Get sidebar background color based on theme"""
+        current_theme = ctk.get_appearance_mode()
+        
+        if current_theme == "Light":
+            return "#2D3748"  # Dark gray for light mode (provides contrast)
+        else:  # Dark or System (dark)
+            return "#1A202C"  # Slightly darker than main dark background
+        
+    def _get_button_colors(self):
+        """Get button colors based on current theme"""
+        current_theme = ctk.get_appearance_mode()
+        
+        if current_theme == "Light":
+            # Light theme button colors (dark gray buttons on dark sidebar)
+            return {
+                "normal": "#4A5568",      # Dark gray
+                "hover": "#2D3748",       # Darker gray on hover
+                "text": "#FFFFFF",        # White text
+                "border": "#718096",      # Medium gray border
+                "selected": "#3182CE",    # Blue for selected state
+                "selected_hover": "#2C5282",  # Darker blue
+                "unselected": "#4A5568",  # Same as normal
+                "unselected_hover": "#2D3748"  # Same as hover
+            }
+        else:  # Dark or System (dark)
+            # Dark theme button colors (slightly lighter gray on dark sidebar)
+            return {
+                "normal": "#4A5568",      # Medium dark gray
+                "hover": "#2D3748",       # Darker gray on hover
+                "text": "#FFFFFF",        # White text
+                "border": "#718096",      # Light gray border
+                "selected": "#3182CE",    # Blue for selected state
+                "selected_hover": "#2C5282",  # Darker blue
+                "unselected": "#4A5568",  # Same as normal
+                "unselected_hover": "#2D3748"  # Same as hover
+            }
+    
+    # ========== NEW ADVANCED MANAGERS ==========
+    
+    def open_domain_manager(self):
+        """Open Domain Manager dialog"""
+        try:
+            dialog = DomainManagerDialog(self)
+            dialog.grab_set()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open Domain Manager: {str(e)}")
+    
+    def open_network_manager(self):
+        """Open Network Manager dialog"""
+        try:
+            from localvm.network_manager import AdvancedNetworkManager
+            # Initialize network manager if not already
+            if not hasattr(self, '_network_manager') or self._network_manager is None:
+                self._network_manager = AdvancedNetworkManager()
+            
+            # Create and show dialog
+            from localvm.gui.network_manager_dialog import NetworkManagerDialog
+            dialog = NetworkManagerDialog(self, self._network_manager)
+            dialog.grab_set()
+        except ImportError as e:
+            messagebox.showerror("Error", 
+                f"Network Manager module not found. Please install dependencies:\n"
+                f"pip install psutil netifaces")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open Network Manager: {str(e)}")
+    
+    def open_database_manager(self):
+        """Open Database Manager dialog"""
+        try:
+            # Try to import psutil first
+            try:
+                import psutil
+            except ImportError:
+                # Offer to install psutil
+                response = messagebox.askyesno(
+                    "Missing Dependency",
+                    "The psutil package is required for database monitoring.\n\n"
+                    "Would you like to install it now?",
+                    parent=self
+                )
+                
+                if response:
+                    try:
+                        import subprocess
+                        import sys
+                        subprocess.check_call([
+                            sys.executable, "-m", "pip", "install", "psutil"
+                        ])
+                        messagebox.showinfo(
+                            "Success",
+                            "psutil installed successfully. Please restart the application.",
+                            parent=self
+                        )
+                        return
+                    except Exception as e:
+                        messagebox.showerror(
+                            "Installation Failed",
+                            f"Failed to install psutil:\n\n{str(e)}",
+                            parent=self
+                        )
+                        return
+                else:
+                    # User chose not to install, continue without psutil
+                    pass
+            
+            # Try to import the correct class from database_manager
+            try:
+                # First try to import LocalDatabaseManager
+                from localvm.database_manager import LocalDatabaseManager
+                db_manager_class = LocalDatabaseManager
+            except ImportError:
+                # If LocalDatabaseManager doesn't exist, try DatabaseManager
+                try:
+                    from localvm.database_manager import DatabaseManager
+                    db_manager_class = DatabaseManager
+                except ImportError as e:
+                    messagebox.showerror(
+                        "Import Error",
+                        f"Cannot find database manager class in database_manager.py\n\n"
+                        f"Error: {str(e)}",
+                        parent=self
+                    )
+                    return
+            
+            # Initialize database manager if not already
+            if not hasattr(self, '_advanced_db_manager') or self._advanced_db_manager is None:
+                self._advanced_db_manager = db_manager_class()
+            
+            # Create and show dialog
+            from localvm.gui.database_manager_dialog import DatabaseManagerDialog
+            dialog = DatabaseManagerDialog(self, self._advanced_db_manager)
+            dialog.grab_set()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open Database Manager: {str(e)}")
+    
+    def open_api_manager(self):
+        """Open API Manager dialog"""
+        try:
+            from localvm.api_manager import APIManager
+            # Initialize API manager if not already
+            if not hasattr(self, '_api_manager') or self._api_manager is None:
+                self._api_manager = APIManager()
+            
+            # Create and show dialog
+            from localvm.gui.api_manager_dialog import APIManagerDialog
+            dialog = APIManagerDialog(self, self._api_manager)
+            dialog.grab_set()
+        except ImportError as e:
+            messagebox.showerror("Error", 
+                f"API Manager module not found. Please install dependencies:\n"
+                f"pip install flask flask-limiter flask-cors")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open API Manager: {str(e)}")
+    
+    def open_system_dashboard(self):
+        """Open System Dashboard dialog"""
+        try:
+            from localvm.gui.dashboard_dialog import SystemDashboardDialog
+            
+            # Get all managers
+            managers = {
+                'vm_manager': self.vm_manager,
+                'ngfw': self.ngfw,
+                'db': self.db
+            }
+            
+            # Add advanced managers if available
+            if hasattr(self, '_network_manager'):
+                managers['network_manager'] = self._network_manager
+            if hasattr(self, '_advanced_db_manager'):
+                managers['db_manager'] = self._advanced_db_manager
+            if hasattr(self, '_api_manager'):
+                managers['api_manager'] = self._api_manager
+            
+            dialog = SystemDashboardDialog(self, managers)
+            dialog.grab_set()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open System Dashboard: {str(e)}")
+    
+    # ========== EXISTING METHODS (updated) ==========
+    
+    def _load_vms(self):
+        """Load VMs from database"""
+        try:
+            from models.vm_model import VirtualMachine
+            from localvm.database import DatabaseManager
+            
+            db = DatabaseManager()
+            results = db.execute_query("""
+                SELECT id, name, description, hypervisor, os_type, 
+                       cpu_cores, memory_mb, disk_gb, ip_address, state,
+                       last_started, created_at, updated_at, mac_address,
+                       network_type, ssh_port
+                FROM virtual_machines 
+                ORDER BY name
+            """)
+            
+            self.vms = []
+            for row in results:
+                vm = VirtualMachine.from_tuple(row)
+                self.vms.append(vm)
+                
+        except Exception as e:
+            logger.error(f"Error loading VMs: {e}")
+            self.vms = []
+    
+    def _add_vm(self):
+        """Open add VM dialog"""
+        def save_callback(vm: VirtualMachine, credentials_settings: Dict):
+            # Use VM manager to create VM with credentials
+            success, message, vm_id = self.vm_manager.create_vm_with_credentials(
+                vm_config=vm.to_dict(),
+                credentials_settings=credentials_settings
+            )
+            
+            if success:
+                messagebox.showinfo("Success", f"VM '{vm.name}' added successfully!\n{message}")
+                self._load_vms()
+                self._refresh_terminal_vms()
+                self._show_vms()
+            else:
+                messagebox.showerror("Error", f"Failed to add VM: {message}")
+        
+        dialog = VMDialog(self, "Add New Virtual Machine", callback=save_callback)
+    
+    def _show_about(self):
+        """Show about dialog"""
+        try:
+            from .about_dialog import AboutDialog
+            dialog = AboutDialog(self, self.config)
+        except ImportError as e:
+            messagebox.showerror("Error", f"Cannot load about dialog: {str(e)}")
+    
+    def _show_logs(self):
+        """Show logs viewer"""
+        self._clear_content()
+        self.welcome_label.configure(text="Application Logs")
+        
+        # Create log viewer widget
+        try:
+            from .log_viewer import LogViewerWidget
+            
+            # Get log file path from config
+            log_file = self.config.log_file
+            
+            if Path(log_file).exists():
+                self.log_viewer = LogViewerWidget(self.content_frame, log_file)
+                self.log_viewer.pack(fill="both", expand=True, padx=10, pady=10)
+            else:
+                # Show message if no log file
+                error_frame = ctk.CTkFrame(self.content_frame)
+                error_frame.pack(expand=True)
+                
+                ctk.CTkLabel(
+                    error_frame,
+                    text="📋 Log Viewer",
+                    font=("Segoe UI", 24, "bold")
+                ).pack(pady=20)
+                
+                ctk.CTkLabel(
+                    error_frame,
+                    text="Log file not found",
+                    font=("Segoe UI", 16),
+                    text_color="gray"
+                ).pack(pady=10)
+                
+                ctk.CTkLabel(
+                    error_frame,
+                    text=f"Expected log file: {log_file}",
+                    font=("Consolas", 11),
+                    text_color="orange"
+                ).pack(pady=10)
+                
+                # Create log file button
+                ModernButton(
+                    error_frame,
+                    text="Create Log File",
+                    command=self._create_log_file,
+                    width=150
+                ).pack(pady=20)
+                
+        except ImportError as e:
+            # Log viewer not available
+            error_frame = ctk.CTkFrame(self.content_frame)
+            error_frame.pack(expand=True)
+            
+            ctk.CTkLabel(
+                error_frame,
+                text="⚠️ Log Viewer Error",
+                font=("Segoe UI", 20, "bold"),
+                text_color="orange"
+            ).pack(pady=20)
+            
+            ctk.CTkLabel(
+                error_frame,
+                text=f"Error loading log viewer: {str(e)}",
+                font=("Consolas", 11),
+                text_color="red"
+            ).pack(pady=10)
+    
+    def _create_log_file(self):
+        """Create log file if it doesn't exist"""
+        try:
+            log_path = Path(self.config.log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Create empty log file
+            log_path.touch()
+            
+            # Add initial log entry
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"{datetime.now().isoformat()} - INFO - Log file created by user\n")
+            
+            # Show success message and refresh
+            messagebox.showinfo("Success", "Log file created successfully")
+            self._show_logs()  # Refresh the view
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create log file: {str(e)}")
+    
+    def _show_dashboard(self):
+        """Show dashboard with VM overview and stats"""
+        self._clear_content()
+        self.welcome_label.configure(text="Dashboard")
+        
+        # Main container
+        main_container = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        main_container.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Stats overview
+        stats_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        stats_frame.pack(fill="x", pady=(0, 20))
+        
+        # Calculate stats
+        total_vms = len(self.vms)
+        running_vms = len([vm for vm in self.vms if vm.state == "Running"])
+        stopped_vms = len([vm for vm in self.vms if vm.state == "Stopped"])
+        total_cpu = sum(vm.cpu_cores for vm in self.vms)
+        total_memory = sum(vm.memory_gb for vm in self.vms)
+        
+        stats = [
+            ("Total VMs", str(total_vms), "#3B82F6"),
+            ("Running", str(running_vms), "#10B981"),
+            ("Stopped", str(stopped_vms), "#EF4444"),
+            ("Resources", f"{total_cpu} CPU / {total_memory:.0f}GB", "#8B5CF6")
+        ]
+        
+        for i, (label, value, color) in enumerate(stats):
+            card = ctk.CTkFrame(
+                stats_frame,
+                width=180,
+                height=80,
+                corner_radius=12,
+                border_width=1,
+                border_color="#E5E7EB"
+            )
+            card.grid(row=0, column=i, padx=(0, 15))
+            
+            ctk.CTkLabel(
+                card,
+                text=label,
+                font=("Segoe UI", 11),
+                text_color="#6B7280"
+            ).place(x=15, y=15)
+            
+            ctk.CTkLabel(
+                card,
+                text=value,
+                font=("Segoe UI", 24, "bold"),
+                text_color=color
+            ).place(x=15, y=35)
+        
+        # Recent VMs section
+        recent_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        recent_frame.pack(fill="both", expand=True)
+        
+        # Section header
+        header = ctk.CTkFrame(recent_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 15))
+        
+        ctk.CTkLabel(
+            header,
+            text="Recent Virtual Machines",
+            font=("Segoe UI", 18, "bold")
+        ).pack(side="left")
+        
+        ModernButton(
+            header,
+            text="View All VMs",
+            command=self._show_vms,
+            width=100,
+            height=35,
+            font=("Segoe UI", 11)
+        ).pack(side="right")
+        
+        # Scrollable frame for VMs
+        vm_scroll = ctk.CTkScrollableFrame(
+            recent_frame,
+            fg_color="transparent",
+            scrollbar_button_color="#3B82F6",
+            scrollbar_button_hover_color="#2563EB"
+        )
+        vm_scroll.pack(fill="both", expand=True)
+        
+        if not self.vms:
+            # Empty state
+            empty_frame = ctk.CTkFrame(vm_scroll, fg_color="transparent")
+            empty_frame.pack(fill="both", expand=True, pady=50)
+            
+            ctk.CTkLabel(
+                empty_frame,
+                text="📁",
+                font=("Segoe UI", 64),
+                text_color="#D1D5DB"
+            ).pack(pady=(0, 20))
+            
+            ctk.CTkLabel(
+                empty_frame,
+                text="No Virtual Machines",
+                font=("Segoe UI", 18, "bold"),
+                text_color="#6B7280"
+            ).pack(pady=(0, 10))
+            
+            ctk.CTkLabel(
+                empty_frame,
+                text="Create your first VM to get started",
+                font=("Segoe UI", 14),
+                text_color="#9CA3AF"
+            ).pack(pady=(0, 30))
+            
+            ModernButton(
+                empty_frame,
+                text="+ Create Your First VM",
+                command=self._add_vm,
+                width=200,
+                height=50,
+                font=("Segoe UI", 14, "bold"),
+                fg_color="#3B82F6",
+                hover_color="#2563EB"
+            ).pack()
+        else:
+            # Show VMs (limit to 10 for dashboard)
+            recent_vms = self.vms[:10]  # Show most recent 10 VMs
+            for vm in recent_vms:
+                # Use the new method
+                self._create_vm_card_for_dashboard(vm_scroll, vm)
+        
+        # Quick actions section
+        actions_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        actions_frame.pack(fill="x", pady=(20, 0))
+        
+        ctk.CTkLabel(
+            actions_frame,
+            text="Quick Actions",
+            font=("Segoe UI", 18, "bold")
+        ).pack(anchor="w", pady=(0, 15))
+        
+        quick_actions = ctk.CTkFrame(actions_frame, fg_color="transparent")
+        quick_actions.pack(fill="x")
+        
+        actions = [
+            ("+ Create VM", self._add_vm, "#3B82F6"),
+            ("📋 Clone VM", lambda: self._show_toast("Select a VM to clone"), "#8B5CF6"),
+            ("💾 Export", lambda: self._show_toast("Select a VM to export"), "#10B981"),
+            ("📊 Performance", lambda: self._show_toast("Performance monitoring"), "#F59E0B"),
+            ("🔧 Settings", self._show_settings, "#6B7280"),
+            ("📖 Help", self._show_help, "#EC4899")
+        ]
+        
+        for i, (text, command, color) in enumerate(actions):
+            ModernButton(
+                quick_actions,
+                text=text,
+                command=command,
+                width=150,
+                height=45,
+                font=("Segoe UI", 12),
+                fg_color=color,
+                hover_color=self._darken_color(color)
+            ).grid(row=0, column=i, padx=5)
+        
+        # Configure grid columns
+        for i in range(len(actions)):
+            quick_actions.grid_columnconfigure(i, weight=1)
+    
+    def _darken_color(self, hex_color: str, factor: float = 0.8) -> str:
+        """Darken a hex color by a factor"""
+        hex_color = hex_color.lstrip('#')
+        rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        darker = tuple(int(c * factor) for c in rgb)
+        return f'#{darker[0]:02x}{darker[1]:02x}{darker[2]:02x}'
+    
+    ###################### update show vm to modern
+    
+    def _show_vms(self):
+        """Show all VMs view with terminal integration - Modern Design"""
+        self._clear_content()
+        self.welcome_label.configure(text="Virtual Machines")
+        
+        # Main container with modern layout
+        main_container = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        main_container.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Header with stats and actions
+        header_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        header_frame.pack(fill="x", pady=(0, 20))
+        
+        # Stats cards
+        stats_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        stats_frame.pack(side="left")
+        
+        # Calculate stats
+        total_vms = len(self.vms)
+        running_vms = len([vm for vm in self.vms if vm.state == "Running"])
+        stopped_vms = len([vm for vm in self.vms if vm.state == "Stopped"])
+        
+        stats = [
+            ("Total VMs", str(total_vms), "#3B82F6"),
+            ("Running", str(running_vms), "#10B981"),
+            ("Stopped", str(stopped_vms), "#EF4444"),
+            ("Resources", f"{sum(vm.cpu_cores for vm in self.vms)} CPU / {sum(vm.memory_gb for vm in self.vms):.0f}GB", "#8B5CF6")
+        ]
+        
+        for i, (label, value, color) in enumerate(stats):
+            card = ctk.CTkFrame(
+                stats_frame,
+                width=180,
+                height=80,
+                corner_radius=12,
+                border_width=1,
+                border_color="#E5E7EB"
+            )
+            card.grid(row=0, column=i, padx=(0, 15))
+            
+            ctk.CTkLabel(
+                card,
+                text=label,
+                font=("Segoe UI", 11),
+                text_color="#6B7280"
+            ).place(x=15, y=15)
+            
+            ctk.CTkLabel(
+                card,
+                text=value,
+                font=("Segoe UI", 24, "bold"),
+                text_color=color
+            ).place(x=15, y=35)
+        
+        # Action buttons
+        action_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        action_frame.pack(side="right")
+        
+        ModernButton(
+            action_frame,
+            text="+ Create VM",
+            command=self._add_vm,
+            width=120,
+            height=40,
+            font=("Segoe UI", 12, "bold"),
+            fg_color="#3B82F6",
+            hover_color="#2563EB"
+        ).pack(side="left", padx=(0, 10))
+        
+        # CHANGE: Use _refresh_vm_view instead of _refresh_vms
+        ModernButton(
+            action_frame,
+            text="↻ Refresh",
+            command=self._refresh_vm_view,  # Changed from _refresh_vms to _refresh_vm_view
+            width=100,
+            height=40,
+            fg_color="#6B7280",
+            hover_color="#4B5563"
+        ).pack(side="left")
+        
+        # Create a modern notebook for VM management
+        self.vm_notebook = ctk.CTkTabview(
+            main_container,
+            segmented_button_selected_color="#3B82F6",
+            segmented_button_selected_hover_color="#2563EB",
+            segmented_button_unselected_color="#F3F4F6",
+            segmented_button_unselected_hover_color="#E5E7EB"
+        )
+        self.vm_notebook.pack(fill="both", expand=True)
+        
+        # Add tabs with modern icons
+        self.vm_list_tab = self.vm_notebook.add("📋 VM List")
+        self.vm_terminal_tab = self.vm_notebook.add("💻 SSH Terminal")
+        self.vm_details_tab = self.vm_notebook.add("📊 VM Details")
+        self.log_viewer_tab = self.vm_notebook.add("📋 Logs")
+        
+        # Setup each tab with modern design
+        self._setup_vm_list_tab_modern()
+        self._setup_vm_terminal_tab_modern()
+        self._setup_vm_details_tab()
+        self._setup_log_viewer_tab()
+        
+        # Load VMs
+        self._load_vms_to_list_modern()
+        self._refresh_terminal_vms()
+    
+    # ADD THIS NEW METHOD
+    def _refresh_vm_view(self):
+        """Refresh the entire VM view"""
+        # Reload VMs from database
+        self._load_vms()
+        
+        # Refresh all components
+        if hasattr(self, 'vm_notebook'):
+            # Refresh VM list tab
+            if hasattr(self, '_load_vms_to_list_modern'):
+                self._load_vms_to_list_modern()
+            
+            # Refresh terminal VM list
+            if hasattr(self, '_refresh_terminal_vms'):
+                self._refresh_terminal_vms()
+            
+            # Refresh stats if we're showing VMs
+            self._update_vm_stats()
+            
+            # Show toast notification
+            self._show_toast("VM list refreshed!")
+        else:
+            # If notebook doesn't exist yet, show VMs view
+            self._show_vms()
+    
+    def _update_vm_stats(self):
+        """Update VM statistics in the header"""
+        if not hasattr(self, 'vm_notebook'):
+            return
+            
+        # This method would update the stats cards if needed
+        # For now, we'll just reload the entire view
+        pass
+    
+    def _setup_vm_list_tab_modern(self):
+        """Setup VM list tab with modern design"""
+        container = self.vm_list_tab
+        
+        # Modern toolbar
+        toolbar = ctk.CTkFrame(container, fg_color="#F9FAFB", height=60, corner_radius=8)
+        toolbar.pack(fill="x", pady=(0, 15))
+        
+        # Left side: Search and filter
+        left_toolbar = ctk.CTkFrame(toolbar, fg_color="transparent")
+        left_toolbar.pack(side="left", padx=20)
+        
+        # Search with icon
+        search_container = ctk.CTkFrame(left_toolbar, fg_color="transparent")
+        search_container.pack(side="left", padx=(0, 20))
+        
+        ctk.CTkLabel(
+            search_container,
+            text="🔍",
+            font=("Segoe UI", 14)
+        ).pack(side="left", padx=(0, 5))
+        
+        self.vm_search_entry = ctk.CTkEntry(
+            search_container,
+            width=250,
+            placeholder_text="Search VM by name...",
+            font=("Segoe UI", 12),
+            border_width=1,
+            border_color="#D1D5DB",
+            corner_radius=20
+        )
+        self.vm_search_entry.pack(side="left")
+        self.vm_search_entry.bind("<Return>", lambda e: self._filter_vm_list_modern())
+        
+        # Filter
+        filter_container = ctk.CTkFrame(left_toolbar, fg_color="transparent")
+        filter_container.pack(side="left")
+        
+        ctk.CTkLabel(
+            filter_container,
+            text="Filter:",
+            font=("Segoe UI", 12, "bold")
+        ).pack(side="left", padx=(0, 10))
+        
+        self.vm_filter_combo = ctk.CTkComboBox(
+            filter_container,
+            values=["All VMs", "Running", "Stopped", "Paused", "Error"],
+            width=150,
+            font=("Segoe UI", 11),
+            border_color="#D1D5DB",
+            button_color="#3B82F6",
+            dropdown_font=("Segoe UI", 11),
+            command=self._filter_vm_list_modern
+        )
+        self.vm_filter_combo.pack(side="left")
+        self.vm_filter_combo.set("All VMs")  # Set default value
+        
+        # Right side: Actions
+        right_toolbar = ctk.CTkFrame(toolbar, fg_color="transparent")
+        right_toolbar.pack(side="right", padx=20)
+        
+        # Bulk actions
+        ModernButton(
+            right_toolbar,
+            text="⚡ Start All",
+            command=self._start_all_vms,
+            width=100,
+            height=32,
+            font=("Segoe UI", 11)
+        ).pack(side="left", padx=5)
+        
+        ModernButton(
+            right_toolbar,
+            text="⏹️ Stop All",
+            command=self._stop_all_vms,
+            width=100,
+            height=32,
+            font=("Segoe UI", 11),
+            fg_color="#EF4444",
+            hover_color="#DC2626"
+        ).pack(side="left", padx=5)
+        
+        # VM List with modern scrollable frame
+        list_container = ctk.CTkFrame(container, fg_color="transparent")
+        list_container.pack(fill="both", expand=True)
+        
+        # Create a scrollable canvas for better performance
+        self.vm_canvas = ctk.CTkCanvas(
+            list_container,
+            bg="#FFFFFF",
+            highlightthickness=0
+        )
+        scrollbar = ctk.CTkScrollbar(
+            list_container,
+            orientation="vertical",
+            command=self.vm_canvas.yview
+        )
+        self.vm_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Frame inside canvas
+        self.vm_list_inner = ctk.CTkFrame(self.vm_canvas, fg_color="#FFFFFF")
+        self.vm_list_inner.bind(
+            "<Configure>",
+            lambda e: self.vm_canvas.configure(scrollregion=self.vm_canvas.bbox("all"))
+        )
+        
+        # Create canvas window
+        self.vm_canvas_window = self.vm_canvas.create_window(
+            (0, 0),
+            window=self.vm_list_inner,
+            anchor="nw",
+            width=self.vm_canvas.winfo_width()
+        )
+        
+        # Bind resize event
+        self.vm_canvas.bind("<Configure>", self._on_canvas_configure)
+        
+        # Pack canvas and scrollbar
+        self.vm_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+    def _on_canvas_configure(self, event):
+        """Handle canvas resize"""
+        self.vm_canvas.itemconfig(self.vm_canvas_window, width=event.width)
+    
+    def _setup_vm_terminal_tab_modern(self):
+        """Setup VM terminal tab with modern design"""
+        container = self.vm_terminal_tab
+
+         # Terminal widget - Set admin mode to True
+        from localvm.gui.terminal_widget import TerminalWidget
+        self.terminal_widget = TerminalWidget(container, is_admin=True)  # Admin mode enabled
+        self.terminal_widget.pack(fill="both", expand=True, pady=(0, 15))
+            
+        # Terminal header with gradient
+        header_frame = ctk.CTkFrame(
+            container,
+            fg_color="transparent",
+            height=80,
+            corner_radius=12
+        )
+        header_frame.pack(fill="x", pady=(0, 15))
+        header_frame.pack_propagate(False)
+        
+        # Gradient background (simulated)
+        ctk.CTkLabel(
+            header_frame,
+            text="",
+            fg_color="#1E293B",
+            corner_radius=12
+        ).pack(fill="both", expand=True)
+        
+        # Terminal controls
+        controls_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        controls_frame.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # VM selector with icon
+        selector_container = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        selector_container.pack(side="left", padx=(0, 20))
+        
+        ctk.CTkLabel(
+            selector_container,
+            text="🖥️",
+            font=("Segoe UI", 16)
+        ).pack(side="left", padx=(0, 10))
+        
+        ctk.CTkLabel(
+            selector_container,
+            text="Select VM:",
+            font=("Segoe UI", 12, "bold"),
+            text_color="white"
+        ).pack(side="left", padx=(0, 10))
+        
+        self.terminal_vm_combo = ctk.CTkComboBox(
+            selector_container,
+            values=[],
+            width=250,
+            font=("Segoe UI", 12),
+            border_color="#4B5563",
+            button_color="#3B82F6",
+            dropdown_font=("Segoe UI", 11),
+            command=self._on_terminal_vm_selected
+        )
+        self.terminal_vm_combo.pack(side="left")
+        
+        # Connection controls
+        connection_frame = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        connection_frame.pack(side="left")
+        
+        ModernButton(
+            connection_frame,
+            text="🔌 Connect",
+            command=self._connect_terminal,
+            width=100,
+            height=32,
+            font=("Segoe UI", 11),
+            fg_color="#10B981",
+            hover_color="#059669"
+        ).pack(side="left", padx=(0, 10))
+        
+        ModernButton(
+            connection_frame,
+            text="↻ Refresh",
+            command=self._refresh_terminal_vms,
+            width=100,
+            height=32,
+            font=("Segoe UI", 11)
+        ).pack(side="left")
+        
+        # Terminal widget
+        self.terminal_widget = TerminalWidget(container)
+        self.terminal_widget.pack(fill="both", expand=True, pady=(0, 15))
+        
+        # Terminal footer with status
+        footer_frame = ctk.CTkFrame(container, fg_color="#F3F4F6", height=40, corner_radius=8)
+        footer_frame.pack(fill="x")
+        footer_frame.pack_propagate(False)
+        
+        self.terminal_status_label = ctk.CTkLabel(
+            footer_frame,
+            text="Terminal ready",
+            font=("Segoe UI", 11),
+            text_color="#6B7280"
+        )
+        self.terminal_status_label.pack(side="left", padx=20)
+    
+    def _setup_vm_details_tab(self):
+        """Setup VM details tab with modern design"""
+        container = self.vm_details_tab
+        
+        # Create scrollable frame
+        details_scroll = ctk.CTkScrollableFrame(
+            container,
+            fg_color="transparent",
+            scrollbar_button_color="#3B82F6",
+            scrollbar_button_hover_color="#2563EB"
+        )
+        details_scroll.pack(fill="both", expand=True)
+        
+        # Details container
+        self.vm_details_container = ctk.CTkFrame(details_scroll, fg_color="transparent")
+        self.vm_details_container.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Initial message
+        self.vm_details_label = ctk.CTkLabel(
+            self.vm_details_container,
+            text="Select a VM from the list to view details",
+            font=("Segoe UI", 14),
+            text_color="#9CA3AF"
+        )
+        self.vm_details_label.pack(pady=50)
+    
+    def _load_vms_to_list_modern(self):
+        """Load VMs into modern list view"""
+        # Clear current list
+        for widget in self.vm_list_inner.winfo_children():
+            widget.destroy()
+        
+        if not self.vms:
+            # Show empty state with illustration
+            empty_frame = ctk.CTkFrame(self.vm_list_inner, fg_color="transparent")
+            empty_frame.pack(fill="both", expand=True, pady=100)
+            
+            ctk.CTkLabel(
+                empty_frame,
+                text="📁",
+                font=("Segoe UI", 64),
+                text_color="#D1D5DB"
+            ).pack(pady=(0, 20))
+            
+            ctk.CTkLabel(
+                empty_frame,
+                text="No Virtual Machines Found",
+                font=("Segoe UI", 18, "bold"),
+                text_color="#6B7280"
+            ).pack(pady=(0, 10))
+            
+            ctk.CTkLabel(
+                empty_frame,
+                text="Create your first VM to get started",
+                font=("Segoe UI", 14),
+                text_color="#9CA3AF"
+            ).pack(pady=(0, 30))
+            
+            ModernButton(
+                empty_frame,
+                text="+ Create Your First VM",
+                command=self._add_vm,
+                width=200,
+                height=50,
+                font=("Segoe UI", 14, "bold"),
+                fg_color="#3B82F6",
+                hover_color="#2563EB"
+            ).pack()
+            return
+        
+        # Create modern VM cards
+        for vm in self.vms:
+            self._create_vm_card(vm)
+    
+    def _create_vm_card(self, vm: VirtualMachine):
+        """Create a modern VM card"""
+        card = CardFrame(self.vm_list_inner, height=140, corner_radius=12)
+        card.pack(fill="x", padx=5, pady=8)
+        
+        # Store VM ID
+        card.vm_id = vm.id
+        
+        # VM icon based on OS
+        os_icons = {
+            "Windows": "🪟",
+            "Linux": "🐧",
+            "macOS": "🍎",
+            "BSD": "👑",
+            "Other": "💻"
+        }
+        os_icon = os_icons.get(vm.os_type, "💻")
+        
+        # Left side: Icon and basic info
+        left_frame = ctk.CTkFrame(card, fg_color="transparent")
+        left_frame.place(x=20, y=20)
+        
+        # OS Icon
+        ctk.CTkLabel(
+            left_frame,
+            text=os_icon,
+            font=("Segoe UI", 24)
+        ).pack(side="left", padx=(0, 15))
+        
+        # VM Info
+        info_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        info_frame.pack(side="left")
+        
+        # VM Name with status dot
+        name_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
+        name_frame.pack(anchor="w")
+        
+        # Status dot
+        status_colors = {
+            "Running": "#10B981",
+            "Stopped": "#EF4444",
+            "Paused": "#F59E0B",
+            "Error": "#DC2626"
+        }
+        ctk.CTkLabel(
+            name_frame,
+            text="●",
+            font=("Segoe UI", 12),
+            text_color=status_colors.get(vm.state, "#6B7280")
+        ).pack(side="left", padx=(0, 10))
+        
+        # VM Name
+        ctk.CTkLabel(
+            name_frame,
+            text=vm.name,
+            font=("Segoe UI", 16, "bold"),
+            cursor="hand2"
+        ).pack(side="left")
+        
+        # Click to view details
+        for widget in name_frame.winfo_children():
+            widget.bind("<Button-1>", lambda e, v=vm: self._show_vm_details_modern(v))
+        
+        # Additional info
+        ctk.CTkLabel(
+            info_frame,
+            text=f"{vm.hypervisor} • {vm.os_type}",
+            font=("Segoe UI", 12),
+            text_color="#6B7280"
+        ).pack(anchor="w", pady=(5, 0))
+        
+        # Right side: Stats and actions
+        right_frame = ctk.CTkFrame(card, fg_color="transparent")
+        right_frame.place(relx=1.0, x=-20, y=20, anchor="ne")
+        
+        # Resource stats
+        stats_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        stats_frame.pack(side="left", padx=(0, 30))
+        
+        stats = [
+            (f"{vm.cpu_cores} CPU", "#3B82F6"),
+            (f"{vm.memory_gb:.1f}GB RAM", "#8B5CF6"),
+            (f"{vm.disk_gb}GB Disk", "#10B981")
+        ]
+        
+        for i, (text, color) in enumerate(stats):
+            stat_label = ctk.CTkLabel(
+                stats_frame,
+                text=text,
+                font=("Segoe UI", 11, "bold"),
+                text_color=color
+            )
+            stat_label.grid(row=0, column=i, padx=(0 if i == 0 else 15, 0))
+        
+        # IP Address
+        if vm.ip_address:
+            ip_frame = ctk.CTkFrame(stats_frame, fg_color="transparent")
+            ip_frame.grid(row=1, column=0, columnspan=3, pady=(10, 0), sticky="w")
+            
+            ctk.CTkLabel(
+                ip_frame,
+                text="IP:",
+                font=("Segoe UI", 11),
+                text_color="#6B7280"
+            ).pack(side="left", padx=(0, 5))
+            
+            ctk.CTkLabel(
+                ip_frame,
+                text=vm.ip_address,
+                font=("Segoe UI", 11, "bold"),
+                text_color="#1F2937",
+                cursor="hand2"
+            ).pack(side="left")
+            
+            # Click to copy IP
+            for widget in ip_frame.winfo_children():
+                widget.bind("<Button-1>", lambda e, ip=vm.ip_address: self._copy_to_clipboard(ip))
+        
+        # Quick actions (bottom of card)
+        actions_frame = ctk.CTkFrame(card, fg_color="#F9FAFB", height=50, corner_radius=0)
+        actions_frame.place(x=0, rely=1.0, y=-50, relwidth=1.0)
+        
+        # Action buttons
+        actions = [
+            ("▶ Start", lambda: self._start_vm(vm.id), "#10B981"),
+            ("⏸ Pause", lambda: self._pause_vm(vm.id), "#F59E0B"),
+            ("⏹ Stop", lambda: self._stop_vm(vm.id), "#EF4444"),
+            ("🔑 Creds", lambda: self._show_credentials(vm.id), "#8B5CF6"),
+            ("🚀 Deploy", lambda: self._deploy_to_vm(vm), "#EC4899"), 
+            ("✏ Edit", lambda: self._edit_vm(vm), "#3B82F6"),
+            ("🗑 Delete", lambda: self._delete_vm(vm.id), "#DC2626"),
+            ("🔌 SSH", lambda: self._open_vm_terminal(vm), "#059669")
+        ]
+        
+        for i, (text, command, color) in enumerate(actions):
+            ModernButton(
+                actions_frame,
+                text=text,
+                command=command,
+                width=80,
+                height=30,
+                font=("Segoe UI", 10),
+                fg_color=color,
+                hover_color=self._darken_color(color)
+            ).place(x=20 + i * 90, y=10)
+
+    
+    def _deploy_to_vm(self, vm: VirtualMachine):
+        """Deploy applications to VM"""
+        dialog = DeploymentDialog(self, self.deployment_engine, vm.id)
+        dialog.grab_set()
+    
+    def _darken_color(self, color):
+        """Darken a hex color for hover effect"""
+        import colorsys
+        # Convert hex to RGB
+        color = color.lstrip('#')
+        rgb = tuple(int(color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+        
+        # Convert to HSL and darken
+        h, l, s = colorsys.rgb_to_hls(*rgb)
+        l = max(0, l - 0.1)  # Darken by 10%
+        
+        # Convert back to RGB and hex
+        rgb = colorsys.hls_to_rgb(h, l, s)
+        rgb = tuple(int(c * 255) for c in rgb)
+        return f'#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}'
+    
+    def _show_vm_details_modern(self, vm: VirtualMachine):
+        """Show VM details in modern details tab"""
+        self.vm_notebook.set("📊 VM Details")
+        
+        # Clear details container
+        for widget in self.vm_details_container.winfo_children():
+            widget.destroy()
+        
+        # Create modern details layout
+        main_frame = ctk.CTkFrame(self.vm_details_container, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True)
+        
+        # Header with back button
+        header_frame = ctk.CTkFrame(main_frame, fg_color="transparent", height=60)
+        header_frame.pack(fill="x", pady=(0, 20))
+        
+        ModernButton(
+            header_frame,
+            text="← Back to List",
+            command=lambda: self.vm_notebook.set("📋 VM List"),
+            width=120,
+            height=36,
+            font=("Segoe UI", 11)
+        ).pack(side="left")
+        
+        # VM title and status
+        title_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        title_frame.pack(side="right")
+        
+        ctk.CTkLabel(
+            title_frame,
+            text=vm.name,
+            font=("Segoe UI", 24, "bold")
+        ).pack(side="left", padx=(0, 20))
+        
+        # Status badge
+        StatusBadge(title_frame, vm.state).pack(side="left")
+        
+        # Two-column layout
+        columns_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        columns_frame.pack(fill="both", expand=True)
+        
+        # Left column: Details
+        left_column = ctk.CTkFrame(columns_frame, fg_color="transparent", width=400)
+        left_column.pack(side="left", fill="y", padx=(0, 20))
+        
+        # Details card
+        details_card = CardFrame(left_column, corner_radius=12)
+        details_card.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(
+            details_card,
+            text="VM Details",
+            font=("Segoe UI", 16, "bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        # Details grid
+        details = [
+            ("Description", vm.description or "No description"),
+            ("Hypervisor", vm.hypervisor),
+            ("OS Type", vm.os_type),
+            ("Created", vm.created_at or "Unknown"),
+            ("Last Started", vm.last_started or "Never"),
+            ("Network Type", getattr(vm, 'network_type', 'NAT'))
+        ]
+        
+        for label, value in details:
+            detail_frame = ctk.CTkFrame(details_card, fg_color="transparent")
+            detail_frame.pack(fill="x", padx=20, pady=8)
+            
+            ctk.CTkLabel(
+                detail_frame,
+                text=label + ":",
+                font=("Segoe UI", 12, "bold"),
+                width=120
+            ).pack(side="left")
+            
+            ctk.CTkLabel(
+                detail_frame,
+                text=value,
+                font=("Segoe UI", 12)
+            ).pack(side="left")
+        
+        # Right column: Resources and actions
+        right_column = ctk.CTkFrame(columns_frame, fg_color="transparent")
+        right_column.pack(side="right", fill="both", expand=True)
+        
+        # Resources card
+        resources_card = CardFrame(right_column, corner_radius=12)
+        resources_card.pack(fill="x", pady=(0, 20))
+        
+        ctk.CTkLabel(
+            resources_card,
+            text="Resources",
+            font=("Segoe UI", 16, "bold")
+        ).pack(anchor="w", padx=20, pady=(20, 15))
+        
+        # Resource metrics
+        resources = [
+            ("CPU Cores", f"{vm.cpu_cores}", "#3B82F6"),
+            ("Memory", f"{vm.memory_gb:.1f} GB", "#8B5CF6"),
+            ("Disk Space", f"{vm.disk_gb} GB", "#10B981"),
+            ("IP Address", vm.ip_address or "Not assigned", "#F59E0B"),
+            ("MAC Address", getattr(vm, 'mac_address', 'Auto-generated'), "#EC4899")
+        ]
+        
+        for i, (label, value, color) in enumerate(resources):
+            resource_frame = ctk.CTkFrame(resources_card, fg_color="transparent")
+            resource_frame.pack(fill="x", padx=20, pady=8)
+            
+            ctk.CTkLabel(
+                resource_frame,
+                text=label + ":",
+                font=("Segoe UI", 12, "bold"),
+                width=100
+            ).pack(side="left")
+            
+            ctk.CTkLabel(
+                resource_frame,
+                text=value,
+                font=("Segoe UI", 12, "bold"),
+                text_color=color
+            ).pack(side="left")
+        
+        # Actions card
+        actions_card = CardFrame(right_column, corner_radius=12)
+        actions_card.pack(fill="x")
+        
+        ctk.CTkLabel(
+            actions_card,
+            text="Quick Actions",
+            font=("Segoe UI", 16, "bold")
+        ).pack(anchor="w", padx=20, pady=(20, 15))
+        
+        # Action buttons grid
+        action_buttons = [
+            ("▶ Start VM", lambda: self._start_vm(vm.id), "#10B981"),
+            ("⏸ Pause VM", lambda: self._pause_vm(vm.id), "#F59E0B"),
+            ("⏹ Stop VM", lambda: self._stop_vm(vm.id), "#EF4444"),
+            ("📊 Performance", lambda: self._show_vm_performance(vm.id), "#3B82F6"),
+            ("💾 Snapshot", lambda: self._take_vm_snapshot(vm.id), "#8B5CF6"),
+            ("🔌 SSH Connect", lambda: self._open_vm_terminal(vm), "#059669"),
+            ("🔑 Credentials", lambda: self._show_credentials(vm.id), "#F59E0B"),
+            ("📋 Logs", lambda: self._show_vm_logs(vm.id), "#6B7280")
+        ]
+        
+        # Create grid of buttons
+        for i in range(0, len(action_buttons), 2):
+            row_frame = ctk.CTkFrame(actions_card, fg_color="transparent")
+            row_frame.pack(fill="x", padx=20, pady=5)
+            
+            for j in range(2):
+                if i + j < len(action_buttons):
+                    text, command, color = action_buttons[i + j]
+                    ModernButton(
+                        row_frame,
+                        text=text,
+                        command=command,
+                        width=180,
+                        height=40,
+                        font=("Segoe UI", 11),
+                        fg_color=color,
+                        hover_color=self._darken_color(color)
+                    ).pack(side="left", padx=(0 if j == 0 else 10, 0))
+    
+    def _filter_vm_list_modern(self, *args):
+        """Filter VM list based on search and filter criteria"""
+        search_term = self.vm_search_entry.get().strip().lower()
+        filter_type = self.vm_filter_combo.get()
+        
+        # Clear current list
+        for widget in self.vm_list_inner.winfo_children():
+            widget.destroy()
+        
+        if not self.vms:
+            return
+        
+        # Filter VMs
+        filtered_vms = self.vms
+        
+        if search_term:
+            filtered_vms = [vm for vm in filtered_vms if search_term in vm.name.lower()]
+        
+        # FIX: Check if filter_type is "All VMs" or empty/None
+        if filter_type and filter_type != "All VMs":
+            state_map = {
+                "Running": "Running",
+                "Stopped": "Stopped",
+                "Paused": "Paused",
+                "Error": "Error"
+            }
+            target_state = state_map.get(filter_type, "")
+            if target_state:  # Only filter if we have a valid state
+                filtered_vms = [vm for vm in filtered_vms if vm.state == target_state]
+        
+        if not filtered_vms:
+            # Show no results
+            no_results = ctk.CTkFrame(self.vm_list_inner, fg_color="transparent")
+            no_results.pack(fill="both", expand=True, pady=100)
+            
+            ctk.CTkLabel(
+                no_results,
+                text="🔍",
+                font=("Segoe UI", 48),
+                text_color="#D1D5DB"
+            ).pack(pady=(0, 20))
+            
+            ctk.CTkLabel(
+                no_results,
+                text="No VMs Found",
+                font=("Segoe UI", 16, "bold"),
+                text_color="#6B7280"
+            ).pack(pady=(0, 10))
+            
+            ctk.CTkLabel(
+                no_results,
+                text="Try adjusting your search or filter",
+                font=("Segoe UI", 14),
+                text_color="#9CA3AF"
+            ).pack()
+            return
+        
+        # Display filtered VMs
+        for vm in filtered_vms:
+            self._create_vm_card(vm)
+
+
+    def _open_vm_terminal(self, vm: VirtualMachine):
+        """Open terminal for specific VM"""
+        # First ensure we're in the VMs view
+        self._show_vms()
+        
+        # Switch to terminal tab
+        self.vm_notebook.set("💻 SSH Terminal")
+        
+        # Update terminal VM combo
+        if hasattr(self, 'terminal_vm_combo'):
+            current_values = self.terminal_vm_combo.cget("values")
+            if vm.name not in current_values:
+                self.terminal_vm_combo.configure(values=list(current_values) + [vm.name])
+            self.terminal_vm_combo.set(vm.name)
+        
+        # Ensure terminal widget exists
+        if not hasattr(self, 'terminal_widget') or self.terminal_widget is None:
+            # Try to find and initialize terminal widget
+            try:
+                # Look for terminal widget in the terminal tab
+                for widget in self.vm_terminal_tab.winfo_children():
+                    if isinstance(widget, TerminalWidget):
+                        self.terminal_widget = widget
+                        break
+                    elif hasattr(widget, 'winfo_children'):
+                        for child in widget.winfo_children():
+                            if isinstance(child, TerminalWidget):
+                                self.terminal_widget = child
+                                break
+            except Exception as e:
+                logger.error(f"Error finding terminal widget: {e}")
+        
+        # If still no terminal widget, try to connect
+        if hasattr(self, 'terminal_widget') and self.terminal_widget is not None:
+            try:
+                self.terminal_widget.set_vm_id(vm.id)
+                self.terminal_widget.set_vm_name(vm.name)
+                self.terminal_widget.set_vm_ip(vm.ip_address)
+                
+                # Load credentials
+                from localvm.credentials_manager import CredentialsManager
+                credentials_manager = CredentialsManager()
+                credentials = credentials_manager.get_credentials(vm.id)
+                
+                if credentials:
+                    self.terminal_widget.set_credentials(
+                        username=credentials.get('username'),
+                        password=credentials.get('password'),
+                        ssh_port=credentials.get('ssh_port', 22)
+                    )
+                
+                # Try to connect
+                success, message = self.terminal_widget.connect()
+                
+                if hasattr(self, 'terminal_status_label'):
+                    if success:
+                        self.terminal_status_label.configure(
+                            text=f"Connected to {vm.name}",
+                            text_color="#10B981"
+                        )
+                    else:
+                        self.terminal_status_label.configure(
+                            text=f"Connection failed: {message}",
+                            text_color="#EF4444"
+                        )
+                        
+            except Exception as e:
+                logger.error(f"Error in open_vm_terminal: {e}")
+                if hasattr(self, 'terminal_status_label'):
+                    self.terminal_status_label.configure(
+                        text=f"Error: {str(e)[:50]}...",
+                        text_color="#EF4444"
+                    )
+        else:
+            # Terminal widget not found, ask user to reinitialize
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Terminal not available. Click 'Reinitialize Terminal'",
+                    text_color="#EF4444"
+                )
+    
+    def _on_terminal_vm_selected(self, choice):
+        """Handle VM selection in terminal tab"""
+        # Find VM by name
+        for vm in self.vms:
+            if vm.name == choice:
+                self.terminal_widget.set_vm_id(vm.id)
+                break
+    
+    def _refresh_terminal_vms(self):
+        """Refresh VM list in terminal tab"""
+        try:
+            # Check if terminal widget exists
+            if not hasattr(self, 'terminal_vm_combo') or not hasattr(self, 'vms'):
+                return
+                
+            # Get VM names from the current VM list
+            vm_names = [vm.name for vm in self.vms]
+            
+            # Update the combo box values
+            self.terminal_vm_combo.configure(values=vm_names)
+            
+            if vm_names:
+                # Set default selection if none selected
+                current_selection = self.terminal_vm_combo.get()
+                if not current_selection or current_selection not in vm_names:
+                    self.terminal_vm_combo.set(vm_names[0])
+                    # Trigger selection event
+                    self._on_terminal_vm_selected(vm_names[0])
+            else:
+                # Clear selection if no VMs
+                self.terminal_vm_combo.set("")
+                if hasattr(self, 'terminal_status_label'):
+                    self.terminal_status_label.configure(
+                        text="No VMs available. Create a VM first.",
+                        text_color="#EF4444"
+                    )
+                # Clear terminal
+                if hasattr(self, 'terminal_widget'):
+                    self.terminal_widget.clear_terminal()
+                    
+        except Exception as e:
+            logger.error(f"Error refreshing terminal VMs: {e}")
+    
+    def _connect_terminal(self):
+        """Connect terminal to selected VM"""
+        vm_name = self.terminal_vm_combo.get()
+        if not vm_name:
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Please select a VM first",
+                    text_color="#EF4444"
+                )
+            return
+        
+        # Find the VM
+        vm = None
+        for v in self.vms:
+            if v.name == vm_name:
+                vm = v
+                break
+        
+        if not vm:
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text=f"VM '{vm_name}' not found",
+                    text_color="#EF4444"
+                )
+            return
+        
+        # Check if terminal widget exists and is properly initialized
+        if not hasattr(self, 'terminal_widget'):
+            # Try to initialize terminal widget
+            try:
+                from localvm.gui.terminal_widget import TerminalWidget
+                # Find the container
+                for widget in self.vm_terminal_tab.winfo_children():
+                    if isinstance(widget, ctk.CTkFrame) and len(widget.winfo_children()) > 0:
+                        # Create terminal widget
+                        self.terminal_widget = TerminalWidget(widget, is_admin=True)
+                        break
+            except Exception as e:
+                logger.error(f"Failed to create terminal widget: {e}")
+                self.terminal_widget = self._create_safe_terminal_widget()
+        
+        # Ensure terminal_widget is not None
+        if self.terminal_widget is None:
+            logger.error("terminal_widget is None, creating safe version")
+            self.terminal_widget = self._create_safe_terminal_widget()
+        
+        try:
+            # Set VM info
+            self.terminal_widget.set_vm_id(vm.id)
+            self.terminal_widget.set_vm_name(vm.name)
+            self.terminal_widget.set_vm_ip(vm.ip_address)
+            
+            # Load credentials
+            from localvm.credentials_manager import CredentialsManager
+            credentials_manager = CredentialsManager()
+            credentials = credentials_manager.get_credentials(vm.id)
+            
+            if credentials:
+                self.terminal_widget.set_credentials(
+                    username=credentials.get('username'),
+                    password=credentials.get('password'),
+                    ssh_port=credentials.get('ssh_port', 22)
+                )
+            
+            # Try to connect
+            success, message = self.terminal_widget.connect()
+            
+            if hasattr(self, 'terminal_status_label'):
+                if success:
+                    self.terminal_status_label.configure(
+                        text=f"Connected to {vm.name}",
+                        text_color="#10B981"
+                    )
+                else:
+                    self.terminal_status_label.configure(
+                        text=f"Connection failed: {message}",
+                        text_color="#EF4444"
+                    )
+                    
+        except AttributeError as e:
+            logger.error(f"Terminal widget missing method: {e}")
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Terminal widget error - missing method",
+                    text_color="#EF4444"
+                )
+            # Recreate terminal widget
+            self._reinitialize_terminal()
+            
+        except Exception as e:
+            logger.error(f"Error connecting terminal: {e}")
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text=f"Connection error: {str(e)[:50]}...",
+                    text_color="#EF4444"
+                )
+    
+    def _copy_to_clipboard(self, text):
+        """Copy text to clipboard"""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            # Show toast notification
+            self._show_toast("Copied to clipboard!")
+        except Exception as e:
+            logger.error(f"Failed to copy to clipboard: {e}")
+    
+    def _show_toast(self, message, duration=2000):
+        """Show a temporary toast notification"""
+        try:
+            # Create toast window
+            toast = ctk.CTkToplevel(self)
+            toast.overrideredirect(True)
+            toast.attributes("-topmost", True)
+            toast.configure(fg_color="#333333", bg_color="#333333")
+            
+            # Set size and position
+            toast_width = 300
+            toast_height = 60
+            toast.geometry(f"{toast_width}x{toast_height}")
+            
+            # Position at bottom right
+            x = self.winfo_x() + self.winfo_width() - toast_width - 20
+            y = self.winfo_y() + self.winfo_height() - toast_height - 20
+            toast.geometry(f"+{x}+{y}")
+            
+            # Toast content
+            ctk.CTkLabel(
+                toast,
+                text=message,
+                font=("Segoe UI", 12),
+                text_color="white",
+                wraplength=250
+            ).pack(expand=True, fill="both", padx=20, pady=10)
+            
+            # Auto-close after duration
+            toast.after(duration, toast.destroy)
+            
+        except Exception as e:
+            logger.error(f"Error showing toast: {e}")
+    
+    def _start_all_vms(self):
+        """Start all stopped VMs"""
+        stopped_vms = [vm for vm in self.vms if vm.state != "Running"]
+        if not stopped_vms:
+            self._show_toast("All VMs are already running!")
+            return
+        
+        for vm in stopped_vms:
+            self._start_vm(vm.id)
+    
+    def _stop_all_vms(self):
+        """Stop all running VMs"""
+        running_vms = [vm for vm in self.vms if vm.state == "Running"]
+        if not running_vms:
+            self._show_toast("No running VMs found!")
+            return
+        
+        for vm in running_vms:
+            self._stop_vm(vm.id)
+    
+    def _show_vm_performance(self, vm_id):
+        """Show VM performance metrics"""
+        # This would show performance charts
+        # For now, show a message
+        self._show_toast("Performance metrics coming soon!")
+    
+    def _take_vm_snapshot(self, vm_id):
+        """Take VM snapshot"""
+        # This would open snapshot dialog
+        # For now, show a message
+        self._show_toast("Snapshot feature coming soon!")
+    
+    def _show_vm_logs(self, vm_id):
+        """Show VM logs"""
+        self.vm_notebook.set("📋 Logs")
+        self._show_toast("VM logs loaded")
+    
+    def _refresh_terminal_vms(self):
+        """Refresh VM list in terminal tab"""
+        # Get VM names from the current VM list
+        vm_names = [vm.name for vm in self.vms]
+        
+        # Update the combo box values
+        self.terminal_vm_combo.configure(values=vm_names)
+        
+        if vm_names:
+            # Set default selection if none selected
+            current_selection = self.terminal_vm_combo.get()
+            if not current_selection or current_selection not in vm_names:
+                self.terminal_vm_combo.set(vm_names[0])
+                # Trigger selection event
+                self._on_terminal_vm_selected(vm_names[0])
+        else:
+            # Clear selection if no VMs
+            self.terminal_vm_combo.set("")
+            self.terminal_status_label.configure(
+                text="No VMs available. Create a VM first.",
+                text_color="#EF4444"
+            )
+            # Clear terminal
+            if hasattr(self, 'terminal_widget'):
+                self.terminal_widget.clear_terminal()
+    
+    def _on_terminal_vm_selected(self, choice):
+        """Handle VM selection in terminal tab"""
+        if not choice:
+            return
+            
+        # Find VM by name
+        selected_vm = None
+        for vm in self.vms:
+            if vm.name == choice:
+                selected_vm = vm
+                break
+        
+        if selected_vm and hasattr(self, 'terminal_widget'):
+            # Update terminal widget
+            self.terminal_widget.set_vm_id(selected_vm.id)
+            self.terminal_widget.set_vm_name(selected_vm.name)
+            self.terminal_widget.set_vm_ip(selected_vm.ip_address)
+            
+            # Update status
+            self.terminal_status_label.configure(
+                text=f"Selected: {selected_vm.name} ({selected_vm.ip_address or 'No IP'})",
+                text_color="#10B981"
+            )
+            
+            # Load credentials if available
+            self._load_vm_credentials_for_terminal(selected_vm.id)
+        else:
+            self.terminal_status_label.configure(
+                text=f"VM '{choice}' not found or terminal not initialized",
+                text_color="#EF4444"
+            )
+    
+    def _load_vm_credentials(self):
+        """Load VM credentials"""
+        if not self.vm_id:
+            return
+        
+        try:
+            credentials = self.credentials_manager.get_credentials(self.vm_id)
+            if credentials:
+                # Update credentials
+                self.username = credentials.get('username')
+                self.password = credentials.get('password')
+                self.ssh_port = credentials.get('ssh_port', 22)
+                
+                # Get VM info for display
+                from ..database import DatabaseManager
+                db = DatabaseManager()
+                vm_info = db.execute_query(
+                    "SELECT name, ip_address FROM virtual_machines WHERE id = ?", 
+                    (self.vm_id,)
+                )
+                
+                if vm_info:
+                    self.vm_name = vm_info[0][0]
+                    self.vm_ip = vm_info[0][1]
+                    
+                    # Update connection info display
+                    self.connection_info.configure(
+                        text=f"{self.vm_name} | {self.username}@{self.vm_ip or 'No IP'}:{self.ssh_port}"
+                    )
+                    
+                    # Store connection details
+                    self.connection_details = {
+                        'ip_address': self.vm_ip,
+                        'username': self.username,
+                        'password': self.password,
+                        'ssh_port': self.ssh_port
+                    }
+                    
+                    # Enable connect button if we have IP
+                    if self.vm_ip:
+                        self.connect_btn.configure(state="normal")
+                        self._print_output(f"✓ Credentials loaded for VM: {self.vm_name}\n", "success")
+                        self._print_output(f"IP Address: {self.vm_ip}\n", "info")
+                        self._print_output(f"Username: {self.username}\n", "info")
+                        self._print_output(f"Port: {self.ssh_port}\n", "info")
+                    else:
+                        self._print_output("⚠ Warning: VM IP address not configured\n", "warning")
+                        self._print_output("Please configure the VM IP address before connecting\n", "info")
+                else:
+                    self._print_output(f"⚠ VM with ID {self.vm_id} not found\n", "warning")
+            else:
+                # No credentials found
+                self._print_output("⚠ No SSH credentials found for this VM\n", "warning")
+                self._print_output("You can add credentials in the VM settings\n", "info")
+                self._print_output("Or click 'Add Credentials' button below\n", "info")
+                
+                # Add a button to add credentials
+                self._add_credentials_button()
+                
+        except Exception as e:
+            self._print_output(f"Error loading credentials: {str(e)}\n", "error")
+    
+    def _add_credentials_button(self):
+        """Add button to create credentials"""
+        if hasattr(self, 'add_cred_btn') and self.add_cred_btn:
+            return
+            
+        # Add button to header
+        header = self.winfo_children()[0]  # Get the header frame
+        button_frame = header.winfo_children()[3]  # Get the button frame
+        
+        self.add_cred_btn = ModernButton(
+            button_frame,
+            text="+ Add Credentials",
+            command=self._open_credentials_dialog,
+            width=120,
+            height=30,
+            fg_color="#10B981",
+            hover_color="#059669"
+        )
+        self.add_cred_btn.pack(side="left", padx=5)
+    
+    def _open_credentials_dialog(self):
+        """Open dialog to add credentials"""
+        try:
+            from ..gui.vm_dialog import VMDialog
+            from ..database import DatabaseManager
+            
+            db = DatabaseManager()
+            vm_info = db.execute_query(
+                "SELECT name, ip_address FROM virtual_machines WHERE id = ?", 
+                (self.vm_id,)
+            )
+            
+            if vm_info:
+                vm_name = vm_info[0][0]
+                
+                # Create a simple dialog for credentials
+                dialog = ctk.CTkToplevel(self)
+                dialog.title(f"Add SSH Credentials for {vm_name}")
+                dialog.geometry("400x300")
+                dialog.transient(self)
+                dialog.grab_set()
+                
+                # Center dialog
+                dialog.update_idletasks()
+                x = self.winfo_x() + self.winfo_width() // 2 - 200
+                y = self.winfo_y() + self.winfo_height() // 2 - 150
+                dialog.geometry(f"+{x}+{y}")
+                
+                # Dialog content
+                container = ctk.CTkFrame(dialog)
+                container.pack(fill="both", expand=True, padx=20, pady=20)
+                
+                ctk.CTkLabel(
+                    container,
+                    text=f"Add SSH Credentials for {vm_name}",
+                    font=("Segoe UI", 16, "bold")
+                ).pack(pady=(0, 20))
+                
+                # Username
+                ctk.CTkLabel(container, text="Username:", font=("Segoe UI", 12)).pack(anchor="w")
+                username_entry = ctk.CTkEntry(container, width=300)
+                username_entry.pack(fill="x", pady=(0, 15))
+                username_entry.insert(0, "root")
+                
+                # Password
+                ctk.CTkLabel(container, text="Password:", font=("Segoe UI", 12)).pack(anchor="w")
+                password_entry = ctk.CTkEntry(container, width=300, show="*")
+                password_entry.pack(fill="x", pady=(0, 15))
+                
+                # Generate password button
+                def generate_password():
+                    password = self.credentials_manager.generate_secure_password()
+                    password_entry.delete(0, "end")
+                    password_entry.insert(0, password)
+                
+                ModernButton(
+                    container,
+                    text="Generate Secure Password",
+                    command=generate_password,
+                    width=200
+                ).pack(pady=(0, 20))
+                
+                # SSH Port
+                ctk.CTkLabel(container, text="SSH Port:", font=("Segoe UI", 12)).pack(anchor="w")
+                port_entry = ctk.CTkEntry(container, width=100)
+                port_entry.pack(anchor="w", pady=(0, 20))
+                port_entry.insert(0, "22")
+                
+                # Buttons
+                button_frame = ctk.CTkFrame(container, fg_color="transparent")
+                button_frame.pack(fill="x", pady=(10, 0))
+                
+                def save_credentials():
+                    username = username_entry.get().strip() or "root"
+                    password = password_entry.get().strip()
+                    port = int(port_entry.get().strip() or "22")
+                    
+                    if not password:
+                        messagebox.showwarning("Warning", "Please enter a password")
+                        return
+                    
+                    # Save credentials
+                    success = self.credentials_manager.save_credentials(
+                        vm_id=self.vm_id,
+                        username=username,
+                        password=password,
+                        ssh_port=port
+                    )
+                    
+                    if success:
+                        self._print_output(f"✓ Credentials saved for user '{username}'\n", "success")
+                        self._load_vm_credentials()  # Reload credentials
+                        if hasattr(self, 'add_cred_btn'):
+                            self.add_cred_btn.destroy()
+                            self.add_cred_btn = None
+                        dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", "Failed to save credentials")
+                
+                ModernButton(
+                    button_frame,
+                    text="Save",
+                    command=save_credentials,
+                    width=100,
+                    fg_color="#10B981"
+                ).pack(side="right", padx=(0, 10))
+                
+                ModernButton(
+                    button_frame,
+                    text="Cancel",
+                    command=dialog.destroy,
+                    width=100
+                ).pack(side="right")
+                
+        except Exception as e:
+            logger.error(f"Error opening credentials dialog: {e}")
+            messagebox.showerror("Error", f"Failed to open credentials dialog: {str(e)}")
+    
+    def _add_credentials_button(self):
+        """Add button to create credentials"""
+        if hasattr(self, 'add_cred_btn') and self.add_cred_btn:
+            return
+            
+        # Add button to header
+        header = self.winfo_children()[0]  # Get the header frame
+        button_frame = header.winfo_children()[3]  # Get the button frame
+        
+        self.add_cred_btn = ModernButton(
+            button_frame,
+            text="+ Add Credentials",
+            command=self._open_credentials_dialog,
+            width=120,
+            height=30,
+            fg_color="#10B981",
+            hover_color="#059669"
+        )
+        self.add_cred_btn.pack(side="left", padx=5)
+    
+    def _open_credentials_dialog(self):
+        """Open dialog to add credentials"""
+        try:
+            from ..gui.vm_dialog import VMDialog
+            from ..database import DatabaseManager
+            
+            db = DatabaseManager()
+            vm_info = db.execute_query(
+                "SELECT name, ip_address FROM virtual_machines WHERE id = ?", 
+                (self.vm_id,)
+            )
+            
+            if vm_info:
+                vm_name = vm_info[0][0]
+                
+                # Create a simple dialog for credentials
+                dialog = ctk.CTkToplevel(self)
+                dialog.title(f"Add SSH Credentials for {vm_name}")
+                dialog.geometry("400x300")
+                dialog.transient(self)
+                dialog.grab_set()
+                
+                # Center dialog
+                dialog.update_idletasks()
+                x = self.winfo_x() + self.winfo_width() // 2 - 200
+                y = self.winfo_y() + self.winfo_height() // 2 - 150
+                dialog.geometry(f"+{x}+{y}")
+                
+                # Dialog content
+                container = ctk.CTkFrame(dialog)
+                container.pack(fill="both", expand=True, padx=20, pady=20)
+                
+                ctk.CTkLabel(
+                    container,
+                    text=f"Add SSH Credentials for {vm_name}",
+                    font=("Segoe UI", 16, "bold")
+                ).pack(pady=(0, 20))
+                
+                # Username
+                ctk.CTkLabel(container, text="Username:", font=("Segoe UI", 12)).pack(anchor="w")
+                username_entry = ctk.CTkEntry(container, width=300)
+                username_entry.pack(fill="x", pady=(0, 15))
+                username_entry.insert(0, "root")
+                
+                # Password
+                ctk.CTkLabel(container, text="Password:", font=("Segoe UI", 12)).pack(anchor="w")
+                password_entry = ctk.CTkEntry(container, width=300, show="*")
+                password_entry.pack(fill="x", pady=(0, 15))
+                
+                # Generate password button
+                def generate_password():
+                    password = self.credentials_manager.generate_secure_password()
+                    password_entry.delete(0, "end")
+                    password_entry.insert(0, password)
+                
+                ModernButton(
+                    container,
+                    text="Generate Secure Password",
+                    command=generate_password,
+                    width=200
+                ).pack(pady=(0, 20))
+                
+                # SSH Port
+                ctk.CTkLabel(container, text="SSH Port:", font=("Segoe UI", 12)).pack(anchor="w")
+                port_entry = ctk.CTkEntry(container, width=100)
+                port_entry.pack(anchor="w", pady=(0, 20))
+                port_entry.insert(0, "22")
+                
+                # Buttons
+                button_frame = ctk.CTkFrame(container, fg_color="transparent")
+                button_frame.pack(fill="x", pady=(10, 0))
+                
+                def save_credentials():
+                    username = username_entry.get().strip() or "root"
+                    password = password_entry.get().strip()
+                    port = int(port_entry.get().strip() or "22")
+                    
+                    if not password:
+                        messagebox.showwarning("Warning", "Please enter a password")
+                        return
+                    
+                    # Save credentials
+                    success = self.credentials_manager.save_credentials(
+                        vm_id=self.vm_id,
+                        username=username,
+                        password=password,
+                        ssh_port=port
+                    )
+                    
+                    if success:
+                        self._print_output(f"✓ Credentials saved for user '{username}'\n", "success")
+                        self._load_vm_credentials()  # Reload credentials
+                        if hasattr(self, 'add_cred_btn'):
+                            self.add_cred_btn.destroy()
+                            self.add_cred_btn = None
+                        dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", "Failed to save credentials")
+                
+                ModernButton(
+                    button_frame,
+                    text="Save",
+                    command=save_credentials,
+                    width=100,
+                    fg_color="#10B981"
+                ).pack(side="right", padx=(0, 10))
+                
+                ModernButton(
+                    button_frame,
+                    text="Cancel",
+                    command=dialog.destroy,
+                    width=100
+                ).pack(side="right")
+                
+        except Exception as e:
+            logger.error(f"Error opening credentials dialog: {e}")
+            messagebox.showerror("Error", f"Failed to open credentials dialog: {str(e)}")    
+
+
+    def _connect_ssh(self):
+        """Connect to VM via SSH"""
+        if not self.connection_details:
+            self._print_output("Error: No connection details available\n", "error")
+            self._print_output("Please add SSH credentials first\n", "info")
+            self._add_credentials_button()  # Show the add credentials button
+            return
+        
+        details = self.connection_details
+        
+        if not details.get('ip_address'):
+            self._print_output("Error: VM IP address not set\n", "error")
+            self._print_output("Please configure the VM IP address in VM settings\n", "info")
+            return
+        
+        if not details.get('username'):
+            self._print_output("Error: SSH username not set\n", "error")
+            self._print_output("Please add SSH credentials first\n", "info")
+            self._add_credentials_button()  # Show the add credentials button
+            return
+        
+        if not details.get('password') or details.get('password') == 'decryption_failed':
+            self._print_output("Error: SSH password not set or invalid\n", "error")
+            self._print_output("Please add SSH credentials first\n", "info")
+            self._add_credentials_button()  # Show the add credentials button
+            return
+        
+     
+    
+    def _load_vm_credentials_for_terminal(self, vm_id):
+        """Load credentials for the selected VM for terminal"""
+        try:
+            from localvm.credentials_manager import CredentialsManager
+            credentials_manager = CredentialsManager()
+            credentials = credentials_manager.get_credentials(vm_id)
+            
+            if credentials and hasattr(self, 'terminal_widget'):
+                # Pass credentials to terminal widget
+                self.terminal_widget.set_credentials(
+                    username=credentials.get('username'),
+                    password=credentials.get('password'),
+                    ssh_port=credentials.get('ssh_port', 22)
+                )
+                return True
+            else:
+                # No credentials found, show message
+                if hasattr(self, 'terminal_widget'):
+                    self.terminal_widget._print_output(
+                        "⚠ No SSH credentials found for this VM\n", 
+                        "warning"
+                    )
+                    self.terminal_widget._print_output(
+                        "You can add credentials in the VM settings\n", 
+                        "info"
+                    )
+                return False
+        except Exception as e:
+            logger.error(f"Error loading credentials for terminal: {e}")
+            return False
+
+    def _load_vm_credentials(self):
+        """Load VM credentials"""
+        if not self.vm_id:
+            return
+        
+        try:
+            credentials = self.credentials_manager.get_credentials(self.vm_id)
+            if credentials:
+                # Update credentials
+                self.username = credentials.get('username')
+                self.password = credentials.get('password')
+                self.ssh_port = credentials.get('ssh_port', 22)
+                
+                # Get VM info for display
+                from ..database import DatabaseManager
+                db = DatabaseManager()
+                vm_info = db.execute_query(
+                    "SELECT name, ip_address FROM virtual_machines WHERE id = ?", 
+                    (self.vm_id,)
+                )
+                
+                if vm_info and len(vm_info) > 0:
+                    self.vm_name = vm_info[0][0]
+                    self.vm_ip = vm_info[0][1]
+                    
+                    # Update connection info display
+                    if self.vm_ip:
+                        self.connection_info.configure(
+                            text=f"{self.vm_name} | {self.username}@{self.vm_ip}:{self.ssh_port}"
+                        )
+                    else:
+                        self.connection_info.configure(
+                            text=f"{self.vm_name} | {self.username}@[No IP]:{self.ssh_port}"
+                        )
+                    
+                    # Store connection details
+                    self.connection_details = {
+                        'ip_address': self.vm_ip,
+                        'username': self.username,
+                        'password': self.password,
+                        'ssh_port': self.ssh_port
+                    }
+                    
+                    # Enable connect button if we have IP
+                    if self.vm_ip:
+                        self.connect_btn.configure(state="normal")
+                        self._print_output(f"✓ Credentials loaded for VM: {self.vm_name}\n", "success")
+                        self._print_output(f"IP Address: {self.vm_ip}\n", "info")
+                        self._print_output(f"Username: {self.username}\n", "info")
+                        self._print_output(f"Port: {self.ssh_port}\n", "info")
+                    else:
+                        self._print_output("⚠ Warning: VM IP address not configured\n", "warning")
+                        self._print_output("Please configure the VM IP address before connecting\n", "info")
+                else:
+                    self._print_output(f"⚠ VM with ID {self.vm_id} not found\n", "warning")
+            else:
+                # No credentials found
+                self._print_output("⚠ No SSH credentials found for this VM\n", "warning")
+                self._print_output("You can add credentials in the VM settings\n", "info")
+                self._print_output("Or click 'Add Credentials' button below\n", "info")
+                
+                # Get VM name for display
+                try:
+                    from ..database import DatabaseManager
+                    db = DatabaseManager()
+                    vm_info = db.execute_query(
+                        "SELECT name FROM virtual_machines WHERE id = ?", 
+                        (self.vm_id,)
+                    )
+                    if vm_info and len(vm_info) > 0:
+                        self.vm_name = vm_info[0][0]
+                        self.connection_info.configure(text=f"{self.vm_name} | No credentials")
+                    else:
+                        self.connection_info.configure(text=f"VM ID {self.vm_id} | No credentials")
+                except:
+                    self.connection_info.configure(text=f"VM ID {self.vm_id} | No credentials")
+                
+                # Add a button to add credentials
+                self._add_credentials_button()
+                
+        except Exception as e:
+            self._print_output(f"Error loading credentials: {str(e)}\n", "error")
+    
+    def _add_credentials_button(self):
+        """Add button to create credentials"""
+        if hasattr(self, 'add_cred_btn') and self.add_cred_btn:
+            return
+            
+        # Add button to header
+        header = self.winfo_children()[0]  # Get the header frame
+        button_frame = header.winfo_children()[3]  # Get the button frame
+        
+        self.add_cred_btn = ModernButton(
+            button_frame,
+            text="+ Add Credentials",
+            command=self._open_credentials_dialog,
+            width=120,
+            height=30,
+            fg_color="#10B981",
+            hover_color="#059669"
+        )
+        self.add_cred_btn.pack(side="left", padx=5)
+    
+    def _open_credentials_dialog(self):
+        """Open dialog to add credentials"""
+        try:
+            from ..gui.vm_dialog import VMDialog
+            from ..database import DatabaseManager
+            
+            db = DatabaseManager()
+            vm_info = db.execute_query(
+                "SELECT name, ip_address FROM virtual_machines WHERE id = ?", 
+                (self.vm_id,)
+            )
+            
+            if vm_info:
+                vm_name = vm_info[0][0]
+                
+                # Create a simple dialog for credentials
+                dialog = ctk.CTkToplevel(self)
+                dialog.title(f"Add SSH Credentials for {vm_name}")
+                dialog.geometry("400x300")
+                dialog.transient(self)
+                dialog.grab_set()
+                
+                # Center dialog
+                dialog.update_idletasks()
+                x = self.winfo_x() + self.winfo_width() // 2 - 200
+                y = self.winfo_y() + self.winfo_height() // 2 - 150
+                dialog.geometry(f"+{x}+{y}")
+                
+                # Dialog content
+                container = ctk.CTkFrame(dialog)
+                container.pack(fill="both", expand=True, padx=20, pady=20)
+                
+                ctk.CTkLabel(
+                    container,
+                    text=f"Add SSH Credentials for {vm_name}",
+                    font=("Segoe UI", 16, "bold")
+                ).pack(pady=(0, 20))
+                
+                # Username
+                ctk.CTkLabel(container, text="Username:", font=("Segoe UI", 12)).pack(anchor="w")
+                username_entry = ctk.CTkEntry(container, width=300)
+                username_entry.pack(fill="x", pady=(0, 15))
+                username_entry.insert(0, "root")
+                
+                # Password
+                ctk.CTkLabel(container, text="Password:", font=("Segoe UI", 12)).pack(anchor="w")
+                password_entry = ctk.CTkEntry(container, width=300, show="*")
+                password_entry.pack(fill="x", pady=(0, 15))
+                
+                # Generate password button
+                def generate_password():
+                    password = self.credentials_manager.generate_secure_password()
+                    password_entry.delete(0, "end")
+                    password_entry.insert(0, password)
+                
+                ModernButton(
+                    container,
+                    text="Generate Secure Password",
+                    command=generate_password,
+                    width=200
+                ).pack(pady=(0, 20))
+                
+                # SSH Port
+                ctk.CTkLabel(container, text="SSH Port:", font=("Segoe UI", 12)).pack(anchor="w")
+                port_entry = ctk.CTkEntry(container, width=100)
+                port_entry.pack(anchor="w", pady=(0, 20))
+                port_entry.insert(0, "22")
+                
+                # Buttons
+                button_frame = ctk.CTkFrame(container, fg_color="transparent")
+                button_frame.pack(fill="x", pady=(10, 0))
+                
+                def save_credentials():
+                    username = username_entry.get().strip() or "root"
+                    password = password_entry.get().strip()
+                    port = int(port_entry.get().strip() or "22")
+                    
+                    if not password:
+                        messagebox.showwarning("Warning", "Please enter a password")
+                        return
+                    
+                    # Save credentials
+                    success = self.credentials_manager.save_credentials(
+                        vm_id=self.vm_id,
+                        username=username,
+                        password=password,
+                        ssh_port=port
+                    )
+                    
+                    if success:
+                        self._print_output(f"✓ Credentials saved for user '{username}'\n", "success")
+                        self._load_vm_credentials()  # Reload credentials
+                        if hasattr(self, 'add_cred_btn'):
+                            self.add_cred_btn.destroy()
+                            self.add_cred_btn = None
+                        dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", "Failed to save credentials")
+                
+                ModernButton(
+                    button_frame,
+                    text="Save",
+                    command=save_credentials,
+                    width=100,
+                    fg_color="#10B981"
+                ).pack(side="right", padx=(0, 10))
+                
+                ModernButton(
+                    button_frame,
+                    text="Cancel",
+                    command=dialog.destroy,
+                    width=100
+                ).pack(side="right")
+                
+        except Exception as e:
+            logger.error(f"Error opening credentials dialog: {e}")
+            messagebox.showerror("Error", f"Failed to open credentials dialog: {str(e)}")
+
+    def _add_credentials_button(self):
+        """Add button to create credentials"""
+        if hasattr(self, 'add_cred_btn') and self.add_cred_btn:
+            return
+            
+        # Add button to header
+        header = self.winfo_children()[0]  # Get the header frame
+        button_frame = header.winfo_children()[3]  # Get the button frame
+        
+        self.add_cred_btn = ModernButton(
+            button_frame,
+            text="+ Add Credentials",
+            command=self._open_credentials_dialog,
+            width=120,
+            height=30,
+            fg_color="#10B981",
+            hover_color="#059669"
+        )
+        self.add_cred_btn.pack(side="left", padx=5)
+    
+    def _open_credentials_dialog(self):
+        """Open dialog to add credentials"""
+        try:
+            from ..gui.vm_dialog import VMDialog
+            from ..database import DatabaseManager
+            
+            db = DatabaseManager()
+            vm_info = db.execute_query(
+                "SELECT name, ip_address FROM virtual_machines WHERE id = ?", 
+                (self.vm_id,)
+            )
+            
+            if vm_info:
+                vm_name = vm_info[0][0]
+                
+                # Create a simple dialog for credentials
+                dialog = ctk.CTkToplevel(self)
+                dialog.title(f"Add SSH Credentials for {vm_name}")
+                dialog.geometry("400x300")
+                dialog.transient(self)
+                dialog.grab_set()
+                
+                # Center dialog
+                dialog.update_idletasks()
+                x = self.winfo_x() + self.winfo_width() // 2 - 200
+                y = self.winfo_y() + self.winfo_height() // 2 - 150
+                dialog.geometry(f"+{x}+{y}")
+                
+                # Dialog content
+                container = ctk.CTkFrame(dialog)
+                container.pack(fill="both", expand=True, padx=20, pady=20)
+                
+                ctk.CTkLabel(
+                    container,
+                    text=f"Add SSH Credentials for {vm_name}",
+                    font=("Segoe UI", 16, "bold")
+                ).pack(pady=(0, 20))
+                
+                # Username
+                ctk.CTkLabel(container, text="Username:", font=("Segoe UI", 12)).pack(anchor="w")
+                username_entry = ctk.CTkEntry(container, width=300)
+                username_entry.pack(fill="x", pady=(0, 15))
+                username_entry.insert(0, "root")
+                
+                # Password
+                ctk.CTkLabel(container, text="Password:", font=("Segoe UI", 12)).pack(anchor="w")
+                password_entry = ctk.CTkEntry(container, width=300, show="*")
+                password_entry.pack(fill="x", pady=(0, 15))
+                
+                # Generate password button
+                def generate_password():
+                    password = self.credentials_manager.generate_secure_password()
+                    password_entry.delete(0, "end")
+                    password_entry.insert(0, password)
+                
+                ModernButton(
+                    container,
+                    text="Generate Secure Password",
+                    command=generate_password,
+                    width=200
+                ).pack(pady=(0, 20))
+                
+                # SSH Port
+                ctk.CTkLabel(container, text="SSH Port:", font=("Segoe UI", 12)).pack(anchor="w")
+                port_entry = ctk.CTkEntry(container, width=100)
+                port_entry.pack(anchor="w", pady=(0, 20))
+                port_entry.insert(0, "22")
+                
+                # Buttons
+                button_frame = ctk.CTkFrame(container, fg_color="transparent")
+                button_frame.pack(fill="x", pady=(10, 0))
+                
+                def save_credentials():
+                    username = username_entry.get().strip() or "root"
+                    password = password_entry.get().strip()
+                    port = int(port_entry.get().strip() or "22")
+                    
+                    if not password:
+                        messagebox.showwarning("Warning", "Please enter a password")
+                        return
+                    
+                    # Save credentials
+                    success = self.credentials_manager.save_credentials(
+                        vm_id=self.vm_id,
+                        username=username,
+                        password=password,
+                        ssh_port=port
+                    )
+                    
+                    if success:
+                        self._print_output(f"✓ Credentials saved for user '{username}'\n", "success")
+                        self._load_vm_credentials()  # Reload credentials
+                        if hasattr(self, 'add_cred_btn'):
+                            self.add_cred_btn.destroy()
+                            self.add_cred_btn = None
+                        dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", "Failed to save credentials")
+                
+                ModernButton(
+                    button_frame,
+                    text="Save",
+                    command=save_credentials,
+                    width=100,
+                    fg_color="#10B981"
+                ).pack(side="right", padx=(0, 10))
+                
+                ModernButton(
+                    button_frame,
+                    text="Cancel",
+                    command=dialog.destroy,
+                    width=100
+                ).pack(side="right")
+                
+        except Exception as e:
+            logger.error(f"Error opening credentials dialog: {e}")
+            messagebox.showerror("Error", f"Failed to open credentials dialog: {str(e)}")
+    
+    
+    
+    def _connect_terminal(self):
+        """Connect terminal to selected VM"""
+        vm_name = self.terminal_vm_combo.get()
+        if vm_name:
+            # Find the VM
+            for vm in self.vms:
+                if vm.name == vm_name:
+                    # Ensure terminal widget exists
+                    if hasattr(self, 'terminal_widget'):
+                        # Set VM info
+                        self.terminal_widget.set_vm_id(vm.id)
+                        self.terminal_widget.set_vm_name(vm.name)
+                        self.terminal_widget.set_vm_ip(vm.ip_address)
+                        
+                        # Try to connect
+                        success, message = self.terminal_widget.connect()
+                        if success:
+                            self.terminal_status_label.configure(
+                                text=f"Connected to {vm.name}",
+                                text_color="#10B981"
+                            )
+                        else:
+                            self.terminal_status_label.configure(
+                                text=f"Connection failed: {message}",
+                                text_color="#EF4444"
+                            )
+                    else:
+                        self.terminal_status_label.configure(
+                            text="Terminal widget not initialized",
+                            text_color="#EF4444"
+                        )
+                    break
+            else:
+                self.terminal_status_label.configure(
+                    text=f"VM '{vm_name}' not found",
+                    text_color="#EF4444"
+                )
+        else:
+            self.terminal_status_label.configure(
+                text="Please select a VM first",
+                text_color="#EF4444"
+            )
+    
+    def _open_vm_terminal(self, vm: VirtualMachine):
+        """Open terminal for specific VM"""
+        # First ensure we're in the VMs view (this creates the notebook if needed)
+        self._show_vms()
+        
+        # Switch to terminal tab
+        self.vm_notebook.set("💻 SSH Terminal")
+        
+        # Update terminal VM combo
+        current_values = self.terminal_vm_combo.cget("values")
+        if vm.name not in current_values:
+            # Update the values list
+            self.terminal_vm_combo.configure(values=list(current_values) + [vm.name])
+        
+        self.terminal_vm_combo.set(vm.name)
+        
+        # Trigger selection
+        self._on_terminal_vm_selected(vm.name)
+        
+        # Update terminal widget
+        if hasattr(self, 'terminal_widget'):
+            self.terminal_widget.set_vm_id(vm.id)
+            self.terminal_widget.set_vm_name(vm.name)
+            self.terminal_widget.set_vm_ip(vm.ip_address)
+            
+            # Load credentials
+            self._load_vm_credentials_for_terminal(vm.id)
+            
+            # Update status
+            self.terminal_status_label.configure(
+                text=f"Ready to connect to {vm.name}",
+                text_color="#10B981"
+            )
+
+
+
+    def _create_vm_row(self, parent, vm: VirtualMachine):
+        """Create a VM row for dashboard (for backward compatibility)"""
+        # Use the modern card design instead of old row design
+        self._create_vm_card_for_dashboard(parent, vm)
+
+
+
+    def create_vm_with_credentials(self, vm_config: Dict, 
+                                  credentials_settings: Dict = None) -> Tuple[bool, str, Optional[int]]:
+        """
+        Create VM with automatic credential generation
+        
+        Args:
+            vm_config: VM configuration
+            credentials_settings: Credentials settings
+            
+        Returns:
+            Tuple of (success, message, vm_id)
+        """
+        try:
+            logger.info(f"Creating VM with config: {vm_config}")
+            
+            # Validate required fields
+            required_fields = ['name', 'hypervisor', 'os_type', 'cpu_cores', 'memory_mb', 'disk_gb']
+            for field in required_fields:
+                if field not in vm_config:
+                    logger.error(f"Missing required field: {field}")
+                    return False, f"Missing required field: {field}", None
+            
+            # Check if VM with same name already exists
+            existing = self.db.execute_query(
+                "SELECT id FROM virtual_machines WHERE name = ?", 
+                (vm_config['name'],)
+            )
+            if existing:
+                logger.error(f"VM with name '{vm_config['name']}' already exists")
+                return False, f"VM with name '{vm_config['name']}' already exists", None
+            
+            # Prepare VM data with all fields
+            vm_data = {
+                'name': vm_config['name'],
+                'description': vm_config.get('description', ''),
+                'hypervisor': vm_config['hypervisor'],
+                'os_type': vm_config['os_type'],
+                'cpu_cores': int(vm_config['cpu_cores']),
+                'memory_mb': int(vm_config['memory_mb']),
+                'disk_gb': int(vm_config['disk_gb']),
+                'ip_address': vm_config.get('ip_address', ''),
+                'state': vm_config.get('state', 'Stopped'),
+                'mac_address': vm_config.get('mac_address', ''),
+                'network_type': vm_config.get('network_type', 'NAT'),
+                'ssh_port': vm_config.get('ssh_port', 22)
+            }
+            
+            # Insert VM into database
+            logger.info(f"Inserting VM into database: {vm_data}")
+            vm_id = self.db.insert_vm(vm_data)
+            
+            if vm_id is None:
+                logger.error("Failed to insert VM into database")
+                return False, "Failed to create VM in database", None
+            
+            logger.info(f"Database insert returned vm_id: {vm_id}")
+            
+            # Create credentials if requested
+            message = f"VM '{vm_config['name']}' created successfully"
+            
+            if credentials_settings:
+                try:
+                    if credentials_settings.get('auto_generate', True):
+                        # Auto-generate credentials
+                        from localvm.credentials_manager import CredentialsManager
+                        cred_manager = CredentialsManager()
+                        credentials = cred_manager.create_vm_credentials(
+                            vm_id=vm_id,
+                            vm_name=vm_config['name'],
+                            ip_address=vm_config.get('ip_address'),
+                            username=credentials_settings.get('username'),
+                            password=credentials_settings.get('password'),
+                            ssh_port=credentials_settings.get('ssh_port', 22)
+                        )
+                        
+                        if credentials:
+                            message += " with auto-generated credentials"
+                        else:
+                            message += " (credential generation failed)"
+                    else:
+                        # Use manual credentials
+                        success = self.credentials_manager.save_credentials(
+                            vm_id=vm_id,
+                            username=credentials_settings.get('username', 'root'),
+                            password=credentials_settings.get('password', ''),
+                            ssh_port=credentials_settings.get('ssh_port', 22),
+                            ssh_key_path=credentials_settings.get('ssh_key_path')
+                        )
+                        
+                        if success:
+                            message += " with specified credentials"
+                        else:
+                            message += " (failed to save credentials)"
+                except Exception as cred_error:
+                    logger.error(f"Error creating credentials: {cred_error}")
+                    logger.error(traceback.format_exc())
+                    message += " (credential creation failed)"
+            
+            # Try to create actual VM based on hypervisor
+            try:
+                hypervisor = vm_config['hypervisor']
+                if hypervisor == "VirtualBox" and "VirtualBox" in self.available_hypervisors:
+                    vm_success, vm_message = self.create_virtualbox_vm(vm_config)
+                    if vm_success:
+                        message += f". {vm_message}"
+                    else:
+                        message += f". VirtualBox creation failed: {vm_message}"
+                # Add other hypervisors here as needed
+            except Exception as vm_create_error:
+                logger.error(f"Error creating actual VM: {vm_create_error}")
+                logger.error(traceback.format_exc())
+                message += " (VM configuration recorded but physical VM not created)"
+            
+            logger.info(f"VM created successfully: {vm_config['name']} (ID: {vm_id})")
+            return True, message, vm_id
+            
+        except Exception as e:
+            logger.error(f"Error creating VM with credentials: {e}")
+            logger.error(traceback.format_exc())
+            return False, f"Error creating VM: {str(e)}", None
+
+
+    def _on_vm_saved(self, vm: VirtualMachine, credentials_settings: dict):
+        """Handle VM saved from dialog"""
+        try:
+            from localvm.vm_manager import VirtualMachineManager
+            from localvm.database import DatabaseManager
+            
+            vm_manager = VirtualMachineManager()
+            db = DatabaseManager()
+            
+            if vm.id:
+                # Update existing VM
+                success = db.update_vm(vm.id, vm.to_dict())
+                message = "VM updated successfully"
+            else:
+                # Create new VM
+                vm_data = vm.to_dict()
+                success, message, vm_id = vm_manager.create_vm_with_credentials(vm_data, credentials_settings)
+                
+                if success and vm_id:
+                    vm.id = vm_id  # Update VM object with new ID
+            
+            if success:
+                # Save credentials if provided
+                if credentials_settings and not credentials_settings.get('auto_generate', True):
+                    # Save manual credentials
+                    db.save_credentials(
+                        vm_id=vm.id,
+                        username=credentials_settings.get('username', 'root'),
+                        password=credentials_settings.get('password', ''),
+                        ssh_port=credentials_settings.get('ssh_port', 22),
+                        ssh_key_path=credentials_settings.get('ssh_key_path')
+                    )
+                elif credentials_settings and credentials_settings.get('auto_generate', True):
+                    # Auto-generate and save credentials
+                    from localvm.credentials_manager import CredentialsManager
+                    cred_manager = CredentialsManager()
+                    cred_manager.create_vm_credentials(
+                        vm_id=vm.id,
+                        vm_name=vm.name,
+                        ip_address=vm.ip_address,
+                        username=credentials_settings.get('username'),
+                        password=credentials_settings.get('password'),
+                        ssh_port=credentials_settings.get('ssh_port', 22)
+                    )
+                
+                self._show_toast(message)
+                self._refresh_vm_view()  # Refresh the view
+            else:
+                messagebox.showerror("Error", message)
+                
+        except Exception as e:
+            logger.error(f"Error saving VM: {e}")
+            messagebox.showerror("Error", f"Failed to save VM: {str(e)}")
+    
+    def _create_vm_card_for_dashboard(self, parent, vm: VirtualMachine):
+        """Create a modern VM card for dashboard"""
+        card = CardFrame(parent, height=100, corner_radius=12)
+        card.pack(fill="x", padx=10, pady=5)
+        
+        # Store VM ID
+        card.vm_id = vm.id
+        
+        # Left side: Icon and basic info
+        left_frame = ctk.CTkFrame(card, fg_color="transparent")
+        left_frame.place(x=20, y=20)
+        
+        # OS Icon
+        os_icons = {
+            "Windows": "🪟",
+            "Linux": "🐧",
+            "macOS": "🍎",
+            "BSD": "👑",
+            "Other": "💻"
+        }
+        os_icon = os_icons.get(vm.os_type, "💻")
+        
+        ctk.CTkLabel(
+            left_frame,
+            text=os_icon,
+            font=("Segoe UI", 24)
+        ).pack(side="left", padx=(0, 15))
+        
+        # VM Info
+        info_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        info_frame.pack(side="left")
+        
+        # VM Name with status dot
+        name_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
+        name_frame.pack(anchor="w")
+        
+        # Status dot
+        status_colors = {
+            "Running": "#10B981",
+            "Stopped": "#EF4444",
+            "Paused": "#F59E0B",
+            "Error": "#DC2626"
+        }
+        ctk.CTkLabel(
+            name_frame,
+            text="●",
+            font=("Segoe UI", 12),
+            text_color=status_colors.get(vm.state, "#6B7280")
+        ).pack(side="left", padx=(0, 10))
+        
+        # VM Name
+        ctk.CTkLabel(
+            name_frame,
+            text=vm.name,
+            font=("Segoe UI", 16, "bold"),
+            cursor="hand2"
+        ).pack(side="left")
+        
+        # Click to view details
+        for widget in name_frame.winfo_children():
+            widget.bind("<Button-1>", lambda e, v=vm: self._show_vm_details_modern(v))
+        
+        # Additional info
+        ctk.CTkLabel(
+            info_frame,
+            text=f"{vm.hypervisor} • {vm.os_type} • {vm.cpu_cores} CPU • {vm.memory_gb:.1f}GB RAM",
+            font=("Segoe UI", 12),
+            text_color="#6B7280"
+        ).pack(anchor="w", pady=(5, 0))
+        
+        # Right side: Status and actions
+        right_frame = ctk.CTkFrame(card, fg_color="transparent")
+        right_frame.place(relx=1.0, x=-20, y=20, anchor="ne")
+        
+        # Status label
+        ctk.CTkLabel(
+            right_frame,
+            text=vm.state,
+            font=("Segoe UI", 12, "bold"),
+            text_color=status_colors.get(vm.state, "#6B7280")
+        ).pack(side="left", padx=(0, 20))
+        
+        # Quick action buttons
+        if vm.state == "Running":
+            action_color = "#EF4444"
+            action_text = "⏹ Stop"
+            action_cmd = lambda: self._stop_vm(vm.id)
+        else:
+            action_color = "#10B981"
+            action_text = "▶ Start"
+            action_cmd = lambda: self._start_vm(vm.id)
+        
+        ModernButton(
+            right_frame,
+            text=action_text,
+            command=action_cmd,
+            width=80,
+            height=30,
+            font=("Segoe UI", 10),
+            fg_color=action_color,
+            hover_color=self._darken_color(action_color)
+        ).pack(side="left")
+
+    ########### LogView code 
+    def _setup_log_viewer_tab(self):
+        """Setup log viewer tab"""
+        try:
+            from localvm.gui.log_viewer import LogViewerWidget
+            
+            # Get log file path from config
+            from localvm.config import config
+            import os
+            from pathlib import Path
+            
+            log_file = None
+            if hasattr(config, 'log_file'):
+                log_file = Path(config.log_file)
+            elif hasattr(config, 'LOG_FILE'):
+                log_file = Path(config.LOG_FILE)
+            else:
+                # Default log file path
+                log_dir = os.path.join(os.path.expanduser("~"), ".localvm", "logs")
+                log_file = Path(log_dir) / "localvm.log"
+            
+            if log_file and log_file.exists():
+                self.log_viewer = LogViewerWidget(self.log_viewer_tab, str(log_file))
+                self.log_viewer.pack(fill="both", expand=True, padx=10, pady=10)
+            else:
+                # Show message if no log file
+                container = ctk.CTkFrame(self.log_viewer_tab, fg_color="transparent")
+                container.pack(fill="both", expand=True)
+                
+                ctk.CTkLabel(
+                    container,
+                    text="📋",
+                    font=("Segoe UI", 64),
+                    text_color="#D1D5DB"
+                ).pack(pady=(0, 20))
+                
+                ctk.CTkLabel(
+                    container,
+                    text="Log Viewer",
+                    font=("Segoe UI", 24, "bold"),
+                    text_color="#374151"
+                ).pack(pady=(0, 10))
+                
+                ctk.CTkLabel(
+                    container,
+                    text="Log file not found or logging not configured",
+                    font=("Segoe UI", 14),
+                    text_color="#6B7280"
+                ).pack(pady=(0, 30))
+                
+                ctk.CTkLabel(
+                    container,
+                    text=f"Expected log file: {log_file}",
+                    font=("Segoe UI", 12),
+                    text_color="#9CA3AF"
+                ).pack(pady=(0, 20))
+                
+                # Create log directory button
+                ModernButton(
+                    container,
+                    text="Create Log Directory",
+                    command=lambda: self._create_log_directory(log_file),
+                    width=180,
+                    height=40,
+                    font=("Segoe UI", 12)
+                ).pack()
+                
+        except ImportError:
+            # Log viewer widget not available
+            self._setup_basic_log_viewer()
+        except Exception as e:
+            logger.error(f"Error setting up log viewer: {e}")
+            self._setup_basic_log_viewer()
+    
+    def _setup_basic_log_viewer(self):
+        """Setup basic log viewer when LogViewerWidget is not available"""
+        container = ctk.CTkFrame(self.log_viewer_tab, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Header
+        ctk.CTkLabel(
+            container,
+            text="Log Viewer",
+            font=("Segoe UI", 24, "bold"),
+            text_color="#374151"
+        ).pack(anchor="w", pady=(0, 20))
+        
+        # Log display area
+        log_frame = CardFrame(container, corner_radius=12)
+        log_frame.pack(fill="both", expand=True, pady=(0, 20))
+        
+        # Create a simple text widget for logs
+        self.log_text = ctk.CTkTextbox(
+            log_frame,
+            font=("Consolas", 10),
+            wrap="word",
+            state="disabled"
+        )
+        self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Toolbar
+        toolbar = ctk.CTkFrame(container, fg_color="transparent")
+        toolbar.pack(fill="x", pady=(0, 10))
+        
+        ModernButton(
+            toolbar,
+            text="↻ Refresh Logs",
+            command=self._refresh_logs,
+            width=120,
+            height=35,
+            font=("Segoe UI", 11)
+        ).pack(side="left", padx=(0, 10))
+        
+        ModernButton(
+            toolbar,
+            text="🗑️ Clear",
+            command=self._clear_logs,
+            width=80,
+            height=35,
+            font=("Segoe UI", 11),
+            fg_color="#EF4444",
+            hover_color="#DC2626"
+        ).pack(side="left", padx=(0, 10))
+        
+        ModernButton(
+            toolbar,
+            text="📋 Copy",
+            command=self._copy_logs,
+            width=80,
+            height=35,
+            font=("Segoe UI", 11),
+            fg_color="#6B7280",
+            hover_color="#4B5563"
+        ).pack(side="left")
+        
+        # Load initial logs
+        self._refresh_logs()
+    
+    def _refresh_logs(self):
+        """Refresh log display"""
+        try:
+            # Try to read log file
+            import logging
+            import os
+            from pathlib import Path
+            
+            # Get root logger
+            root_logger = logging.getLogger()
+            
+            # Try to find log file from handlers
+            log_file = None
+            for handler in root_logger.handlers:
+                if hasattr(handler, 'baseFilename'):
+                    log_file = Path(handler.baseFilename)
+                    break
+            
+            if not log_file:
+                # Check common log locations
+                possible_locations = [
+                    Path("logs/localvm.log"),
+                    Path("localvm.log"),
+                    Path(os.path.join(os.path.expanduser("~"), ".localvm", "logs", "localvm.log")),
+                    Path(os.path.join(os.path.expanduser("~"), "LocalVM", "logs", "localvm.log")),
+                ]
+                
+                for location in possible_locations:
+                    if location.exists():
+                        log_file = location
+                        break
+            
+            if log_file and log_file.exists():
+                # Read log file
+                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    log_content = f.read()
+                
+                # Display logs
+                self.log_text.configure(state="normal")
+                self.log_text.delete("1.0", "end")
+                self.log_text.insert("1.0", log_content)
+                self.log_text.configure(state="disabled")
+                
+                # Scroll to end
+                self.log_text.see("end")
+            else:
+                # Show message
+                self.log_text.configure(state="normal")
+                self.log_text.delete("1.0", "end")
+                self.log_text.insert("1.0", "No log file found.\n\nCheck log configuration.")
+                self.log_text.configure(state="disabled")
+                
+        except Exception as e:
+            # Show error in log display
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("1.0", f"Error loading logs: {str(e)}")
+            self.log_text.configure(state="disabled")
+    
+    def _clear_logs(self):
+        """Clear log display"""
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+            self._show_toast("Log display cleared")
+        except Exception as e:
+            logger.error(f"Error clearing logs: {e}")
+    
+    def _copy_logs(self):
+        """Copy logs to clipboard"""
+        try:
+            log_content = self.log_text.get("1.0", "end-1c")
+            if log_content:
+                self.clipboard_clear()
+                self.clipboard_append(log_content)
+                self._show_toast("Logs copied to clipboard")
+        except Exception as e:
+            logger.error(f"Error copying logs: {e}")
+            self._show_toast("Failed to copy logs", text_color="#EF4444")
+    
+    def _create_log_directory(self, log_file_path):
+        """Create log directory and file"""
+        try:
+            import os
+            from pathlib import Path
+            
+            # Create directory
+            log_dir = log_file_path.parent
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create empty log file
+            if not log_file_path.exists():
+                log_file_path.touch()
+            
+            # Setup basic logging
+            import logging
+            
+            # Configure logging
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                handlers=[
+                    logging.FileHandler(str(log_file_path)),
+                    logging.StreamHandler()
+                ]
+            )
+            
+            self._show_toast(f"Log directory created: {log_dir}")
+            self._refresh_logs()
+            
+        except Exception as e:
+            logger.error(f"Error creating log directory: {e}")
+            self._show_toast(f"Failed to create log directory: {str(e)}", text_color="#EF4444")
+
+    ##################
+    
+    def _show_file_manager(self):
+        """Show file manager"""
+        try:
+            dialog = FileManagerDialog(self)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open File Manager: {str(e)}")
+    
+    def _show_firewall(self):
+        """Show NGFW manager"""
+        try:
+            dialog = FirewallDialog(self)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open Firewall: {str(e)}")
+    
+    def _show_australia_ips(self):
+        """Show Australian IP generator"""
+        dialog = AustraliaIPDialog(self)
+    
+    def _show_credentials(self, vm_id: int):
+        """Show credentials dialog"""
+        dialog = CredentialsDialog(self, vm_id)
+    
+    
+    def _toggle_vm_state(self, vm: VirtualMachine):
+        """Toggle VM state"""
+        new_state = "Running" if vm.state != "Running" else "Stopped"
+        if self.db.update_vm_state(vm.id, new_state):
+            vm.state = new_state
+            self._show_dashboard()
+            messagebox.showinfo("Success", f"VM '{vm.name}' is now {new_state}")
+    
+    def _start_vm(self, vm_id: int):
+        """Start a VM"""
+        if self.db.update_vm_state(vm_id, "Running"):
+            self._load_vms()
+            self._refresh_terminal_vms()
+            messagebox.showinfo("Success", "VM started")
+    
+    def _stop_vm(self, vm_id: int):
+        """Stop a VM"""
+        if self.db.update_vm_state(vm_id, "Stopped"):
+            self._load_vms()
+            self._refresh_terminal_vms()
+            messagebox.showinfo("Success", "VM stopped")
+    
+    def _pause_vm(self, vm_id: int):
+        """Pause a VM"""
+        if self.db.update_vm_state(vm_id, "Paused"):
+            self._load_vms()
+            self._refresh_terminal_vms()
+            messagebox.showinfo("Success", "VM paused")
+    
+    def _edit_vm(self, vm: VirtualMachine):
+        """Edit a VM"""
+        def update_callback(updated_vm: VirtualMachine, credentials_settings: Dict):
+            try:
+                # Update VM in database
+                success, message = self.vm_manager.update_vm(updated_vm)
+                
+                if not success:
+                    messagebox.showerror("Error", f"Failed to update VM: {message}")
+                    return
+                
+                # Handle credentials
+                final_message = f"VM '{updated_vm.name}' updated successfully"
+                
+                # Note: You need to implement credentials_manager in your VM manager
+                if hasattr(self.vm_manager, 'credentials_manager') and credentials_settings:
+                    if credentials_settings.get('auto_generate', True):
+                        # Auto-generate new credentials
+                        new_creds = self.vm_manager.credentials_manager.create_vm_credentials(
+                            vm_id=vm.id,
+                            vm_name=updated_vm.name,
+                            ip_address=updated_vm.ip_address
+                        )
+                        
+                        if new_creds:
+                            final_message += " with new auto-generated credentials"
+                        else:
+                            final_message += " (failed to generate new credentials)"
+                    else:
+                        # Manual credentials
+                        username = credentials_settings.get('username')
+                        password = credentials_settings.get('password')
+                        ssh_port = credentials_settings.get('ssh_port', 22)
+                        
+                        # Save credentials
+                        if username and password:
+                            success = self.vm_manager.credentials_manager.save_credentials(
+                                vm_id=vm.id,
+                                username=username,
+                                password=password,
+                                ssh_port=ssh_port,
+                                ssh_key_path=None  # Add SSH key handling if needed
+                            )
+                            
+                            if success:
+                                final_message += " with updated credentials"
+                            else:
+                                final_message += " (failed to update credentials)"
+                        else:
+                            final_message += " (credentials not changed)"
+                else:
+                    final_message += " (credentials manager not available)"
+                
+                messagebox.showinfo("Success", final_message)
+                
+                # Refresh VM list and terminal
+                self._load_vms()
+                self._refresh_terminal_vms()
+                
+            except Exception as e:
+                logger.error(f"Error updating VM: {e}")
+                messagebox.showerror("Error", f"Failed to update VM: {str(e)}")
+        
+        # Create dialog with existing VM
+        dialog = VMDialog(self, f"Edit {vm.name}", vm, update_callback)
+    
+    def _delete_vm(self, vm_id: int):
+        """Delete a VM"""
+        if messagebox.askyesno("Confirm", "Are you sure you want to delete this VM?"):
+            if self.db.delete_vm(vm_id):
+                self._load_vms()
+                self._refresh_terminal_vms()
+                messagebox.showinfo("Success", "VM deleted successfully!")
+    
+    def _connect_to_vm(self, vm: VirtualMachine):
+        """Connect to VM via SSH"""
+        if not vm.ip_address:
+            messagebox.showwarning("No IP", "VM IP address is not set. Please set an IP address first.")
+            return
+        
+        # Switch to terminal tab
+        self._open_vm_terminal(vm)
+        
+        # Try to connect automatically
+        if hasattr(self.terminal_widget, '_connect_ssh'):
+            # Give a moment for the terminal to initialize
+            self.after(1000, self.terminal_widget._connect_ssh)
+    
+    def _show_settings(self):
+        """Show settings view"""
+        self._clear_content()
+        self.welcome_label.configure(text="Settings")
+        
+        settings_frame = CardFrame(self.content_frame)
+        settings_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(
+            settings_frame,
+            text="Application Settings",
+            font=("Segoe UI", 18, "bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        # Settings options
+        settings = [
+            ("Database Path:", self.config.database_path),
+            ("Default Theme:", self.config.default_theme),
+            ("Window Size:", self.config.window_size),
+            ("Log File:", self.config.log_file if hasattr(self.config, 'log_file') else "Not set"),
+        ]
+        
+        for i, (label, value) in enumerate(settings):
+            frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+            frame.pack(fill="x", padx=20, pady=10)
+            
+            ctk.CTkLabel(frame, text=label, font=("Segoe UI", 12)).pack(side="left")
+            ctk.CTkLabel(frame, text=value, font=("Segoe UI", 12, "bold")).pack(side="right")
+        
+        # Advanced settings button
+        advanced_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        advanced_frame.pack(fill="x", padx=20, pady=20)
+        
+        ModernButton(
+            advanced_frame,
+            text="Advanced Settings",
+            command=self._show_advanced_settings,
+            width=200
+        ).pack()
+    
+    def _show_advanced_settings(self):
+        """Show advanced settings dialog"""
+        try:
+            from localvm.gui.advanced_settings_dialog import AdvancedSettingsDialog
+            dialog = AdvancedSettingsDialog(self, self.config)
+            dialog.grab_set()
+        except ImportError as e:
+            messagebox.showerror("Error", f"Advanced settings not available: {str(e)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open advanced settings: {str(e)}")
+    
+    def _show_stats(self):
+        """Show statistics view"""
+        self._clear_content()
+        self.welcome_label.configure(text="Statistics")
+        
+        stats_frame = CardFrame(self.content_frame)
+        stats_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(
+            stats_frame,
+            text="VM Statistics",
+            font=("Segoe UI", 18, "bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        # Calculate stats
+        total_cpu = sum(vm.cpu_cores for vm in self.vms)
+        total_memory = sum(vm.memory_mb for vm in self.vms)
+        total_disk = sum(vm.disk_gb for vm in self.vms)
+        
+        stats = [
+            ("Total VMs:", len(self.vms)),
+            ("Total CPU Cores:", total_cpu),
+            ("Total Memory:", f"{total_memory/1024:.1f} GB"),
+            ("Total Disk Space:", f"{total_disk} GB"),
+            ("Avg Memory per VM:", f"{total_memory/len(self.vms)/1024:.1f} GB" if self.vms else "0 GB"),
+            ("Running VMs:", sum(1 for vm in self.vms if vm.state == "Running")),
+            ("Stopped VMs:", sum(1 for vm in self.vms if vm.state == "Stopped")),
+            ("Paused VMs:", sum(1 for vm in self.vms if vm.state == "Paused")),
+        ]
+        
+        for label, value in stats:
+            frame = ctk.CTkFrame(stats_frame, fg_color="transparent")
+            frame.pack(fill="x", padx=20, pady=8)
+            
+            ctk.CTkLabel(frame, text=label, font=("Segoe UI", 12)).pack(side="left")
+            ctk.CTkLabel(frame, text=str(value), font=("Segoe UI", 12, "bold")).pack(side="right")
+    
+    def _show_help(self):
+        """Show help view"""
+        self._clear_content()
+        self.welcome_label.configure(text="Help & Documentation")
+        
+        help_frame = CardFrame(self.content_frame)
+        help_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        help_text = """
+        LocalVM Manager - Help Guide
+        
+        CORE FEATURES:
+        1. Virtual Machine Management:
+           - Add, edit, delete VMs
+           - Start/stop/pause VM operations
+           - SSH terminal access
+           - Resource allocation (CPU, Memory, Disk)
+        
+        2. Advanced Network Manager:
+           - Virtual network creation and management
+           - VLAN support and segmentation
+           - Firewall rule management
+           - Load balancer configuration
+           - Network monitoring and diagnostics
+        
+        3. Database Manager:
+           - Multi-database support (MySQL, PostgreSQL, MongoDB, Redis, SQLite)
+           - Database instance management
+           - Automated backup scheduling
+           - Performance monitoring
+           - User and permission management
+        
+        4. API Manager:
+           - RESTful API for all operations
+           - Token-based authentication
+           - API key management
+           - Rate limiting and logging
+           - OpenAPI documentation
+        
+        5. Domain Manager:
+           - Domain and subdomain management
+           - DNS configuration
+           - Hosts file integration
+           - Domain testing and validation
+        
+        6. System Dashboard:
+           - Real-time system monitoring
+           - Resource usage statistics
+           - Health checks and diagnostics
+           - Performance analytics
+        
+        ADDITIONAL FEATURES:
+        - File Manager for VM storage
+        - Next-Generation Firewall with compliance
+        - Australian IP generator
+        - Credential management
+        - Theme switching (Light/Dark/System)
+        - Log viewer and management
+        
+        QUICK START:
+        1. Add your first VM using the "Add VM" button
+        2. Configure networks using Network Manager
+        3. Set up databases using Database Manager
+        4. Enable API access using API Manager
+        5. Monitor everything in System Dashboard
+        
+        For detailed documentation, please visit our website.
+        """
+        
+        # Create scrollable text widget
+        text_widget = ctk.CTkTextbox(help_frame, font=("Consolas", 11))
+        text_widget.pack(fill="both", expand=True, padx=20, pady=20)
+        text_widget.insert("1.0", help_text)
+        text_widget.configure(state="disabled")  # Make it read-only
+    
+    def _switch_theme(self, theme: str):
+        """Switch application theme"""
+        theme_map = {
+            "🌙 Dark": "dark",
+            "☀️ Light": "light", 
+            "🖥️ System": "system"
+        }
+        self.theme_manager.set_theme(theme_map[theme])
+        
+        # Refresh sidebar colors when theme changes
+        self._refresh_sidebar_colors()
+
+    def _refresh_sidebar_colors(self):
+        """Refresh sidebar colors after theme change"""
+        # Update sidebar background
+        sidebar_color = self._get_sidebar_color()
+        self.sidebar.configure(fg_color=sidebar_color)
+        
+        # Update button colors
+        button_colors = self._get_button_colors()
+        
+        # Update all sidebar buttons
+        for widget in self.sidebar.winfo_children():
+            if hasattr(widget, 'winfo_children'):
+                for child in widget.winfo_children():
+                    if isinstance(child, ctk.CTkScrollableFrame):
+                        for btn in child.winfo_children():
+                            if isinstance(btn, ctk.CTkButton) or hasattr(btn, 'configure'):
+                                # Update button colors
+                                btn.configure(
+                                    fg_color=button_colors["normal"],
+                                    hover_color=button_colors["hover"],
+                                    text_color=button_colors["text"],
+                                    border_color=button_colors["border"]
+                                )
+        
+        # Update theme switcher colors
+        if hasattr(self, 'theme_switch'):
+            self.theme_switch.configure(
+                fg_color=button_colors["normal"],
+                selected_color=button_colors["selected"],
+                selected_hover_color=button_colors["selected_hover"],
+                unselected_color=button_colors["unselected"],
+                unselected_hover_color=button_colors["unselected_hover"]
+            )
+    
+    def _clear_content(self):
+        """Clear content frame"""
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+    
+    def _validate_vm_data(self, vm_data: dict) -> Tuple[bool, List[str]]:
+        """Validate VM data before saving"""
+        return self.validators.validate_vm_config(vm_data)
+    
+    def _backup_database(self):
+        """Backup database"""
+        success, message = self.helpers.backup_database(
+            Path(self.config.database_path)
+        )
+        if success:
+            messagebox.showinfo("Backup Successful", message)
+        else:
+            messagebox.showerror("Backup Failed", message)
+    
+    def _restore_database(self):
+        """Restore database from backup"""
+        from tkinter import filedialog
+        backup_file = filedialog.askopenfilename(
+            title="Select Backup File",
+            filetypes=[("Database files", "*.db"), ("All files", "*.*")]
+        )
+        
+        if backup_file:
+            if messagebox.askyesno("Confirm Restore", 
+                                  "Restore will replace current database. Continue?"):
+                success, message = self.helpers.restore_database(
+                    Path(backup_file),
+                    Path(self.config.database_path)
+                )
+                if success:
+                    messagebox.showinfo("Restore Successful", message)
+                    # Reload VMs after restore
+                    self._load_vms()
+                    self._refresh_terminal_vms()
+                    self._show_dashboard()
+                else:
+                    messagebox.showerror("Restore Failed", message)
+
+    def _setup_vm_terminal_tab_modern(self):
+        """Setup VM terminal tab with modern design"""
+        container = self.vm_terminal_tab
+        
+        # Terminal header with gradient
+        header_frame = ctk.CTkFrame(
+            container,
+            fg_color="transparent",
+            height=80,
+            corner_radius=12
+        )
+        header_frame.pack(fill="x", pady=(0, 15))
+        header_frame.pack_propagate(False)
+        
+        # Gradient background (simulated)
+        ctk.CTkLabel(
+            header_frame,
+            text="",
+            fg_color="#1E293B",
+            corner_radius=12
+        ).pack(fill="both", expand=True)
+        
+        # Terminal controls
+        controls_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        controls_frame.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # VM selector with icon
+        selector_container = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        selector_container.pack(side="left", padx=(0, 20))
+        
+        ctk.CTkLabel(
+            selector_container,
+            text="🖥️",
+            font=("Segoe UI", 16)
+        ).pack(side="left", padx=(0, 10))
+        
+        ctk.CTkLabel(
+            selector_container,
+            text="Select VM:",
+            font=("Segoe UI", 12, "bold"),
+            text_color="white"
+        ).pack(side="left", padx=(0, 10))
+        
+        self.terminal_vm_combo = ctk.CTkComboBox(
+            selector_container,
+            values=[],
+            width=250,
+            font=("Segoe UI", 12),
+            border_color="#4B5563",
+            button_color="#3B82F6",
+            dropdown_font=("Segoe UI", 11),
+            command=self._on_terminal_vm_selected
+        )
+        self.terminal_vm_combo.pack(side="left")
+        
+        # Connection controls
+        connection_frame = ctk.CTkFrame(controls_frame, fg_color="transparent")
+        connection_frame.pack(side="left")
+        
+        # Auto-refresh button
+        ModernButton(
+            connection_frame,
+            text="↻ Refresh List",
+            command=self._refresh_terminal_vms,
+            width=120,
+            height=32,
+            font=("Segoe UI", 11)
+        ).pack(side="left", padx=(0, 10))
+        
+        ModernButton(
+            connection_frame,
+            text="🔌 Connect",
+            command=self._connect_terminal,
+            width=100,
+            height=32,
+            font=("Segoe UI", 11),
+            fg_color="#10B981",
+            hover_color="#059669"
+        ).pack(side="left")
+        
+        # ADD THIS: Install SSH requirements button (for admin)
+        ModernButton(
+            connection_frame,
+            text="⚙️ SSH Setup",
+            command=self._setup_ssh_requirements,
+            width=120,
+            height=32,
+            font=("Segoe UI", 11),
+            fg_color="#8B5CF6",
+            hover_color="#7C3AED"
+        ).pack(side="left", padx=(10, 0))
+        
+        # Terminal widget - WITH ERROR HANDLING
+        try:
+            from localvm.gui.terminal_widget import TerminalWidget
+            # Create terminal widget WITH is_admin=True parameter
+            self.terminal_widget = TerminalWidget(container, is_admin=True)
+            self.terminal_widget.pack(fill="both", expand=True, pady=(0, 15))
+            
+            # Set a flag that terminal is initialized
+            self.terminal_initialized = True
+            
+            logger.info("Terminal widget created successfully with admin privileges")
+            
+        except ImportError as e:
+            logger.error(f"Failed to import TerminalWidget: {e}")
+            self._show_terminal_error(container, f"Missing module: {e}")
+            self.terminal_widget = self._create_fallback_terminal_widget()
+            self.terminal_initialized = False
+            
+        except Exception as e:
+            logger.error(f"Failed to create terminal widget: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._show_terminal_error(container, str(e))
+            self.terminal_widget = self._create_fallback_terminal_widget()
+            self.terminal_initialized = False
+        
+        # Terminal footer with status
+        footer_frame = ctk.CTkFrame(container, fg_color="#F3F4F6", height=40, corner_radius=8)
+        footer_frame.pack(fill="x")
+        footer_frame.pack_propagate(False)
+        
+        self.terminal_status_label = ctk.CTkLabel(
+            footer_frame,
+            text="Select a VM from the dropdown to connect",
+            font=("Segoe UI", 11),
+            text_color="#6B7280"
+        )
+        self.terminal_status_label.pack(side="left", padx=20)
+        
+        # Add reinitialize button in footer
+        ModernButton(
+            footer_frame,
+            text="🔄 Fix Terminal",
+            command=self._reinitialize_terminal,
+            width=120,
+            height=30,
+            font=("Segoe UI", 10)
+        ).pack(side="right", padx=20)
+        
+        # Initial refresh
+        self.after(100, self._refresh_terminal_vms)
+
+    def _show_terminal_error(self, container, error_message):
+        """Show error message when terminal fails to initialize"""
+        error_frame = ctk.CTkFrame(container, fg_color="transparent")
+        error_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(
+            error_frame,
+            text="⚠️ SSH Terminal Error",
+            font=("Segoe UI", 20, "bold"),
+            text_color="#EF4444"
+        ).pack(pady=(0, 10))
+        
+        ctk.CTkLabel(
+            error_frame,
+            text=f"Error: {error_message}",
+            font=("Consolas", 11),
+            text_color="#DC2626",
+            wraplength=600
+        ).pack(pady=(0, 20))
+        
+        # Installation instructions
+        ctk.CTkLabel(
+            error_frame,
+            text="To fix this, install required packages:",
+            font=("Segoe UI", 12, "bold")
+        ).pack(pady=(0, 10))
+        
+        install_commands = [
+            "pip install paramiko",
+            "pip install cryptography",
+            "pip install ssh-python"
+        ]
+        
+        for cmd in install_commands:
+            cmd_frame = ctk.CTkFrame(error_frame, fg_color="#1F2937", corner_radius=6)
+            cmd_frame.pack(fill="x", pady=3, padx=20)
+            
+            ctk.CTkLabel(
+                cmd_frame,
+                text=cmd,
+                font=("Consolas", 10),
+                text_color="#60A5FA"
+            ).pack(padx=10, pady=5)
+
+    def _create_fallback_terminal_widget(self):
+        """Create a fallback terminal widget to prevent None errors"""
+        class FallbackTerminalWidget:
+            def __init__(self):
+                self.vm_id = None
+                self.vm_name = None
+                self.vm_ip = None
+                self.connected = False
+                self.is_admin = True  # Default to admin mode
+                
+            def set_vm_id(self, vm_id):
+                self.vm_id = vm_id
+                logger.debug(f"FallbackTerminalWidget: set_vm_id({vm_id})")
+                
+            def set_vm_name(self, name):
+                self.vm_name = name
+                logger.debug(f"FallbackTerminalWidget: set_vm_name({name})")
+                
+            def set_vm_ip(self, ip):
+                self.vm_ip = ip
+                logger.debug(f"FallbackTerminalWidget: set_vm_ip({ip})")
+                
+            def set_credentials(self, username=None, password=None, ssh_port=22):
+                logger.debug(f"FallbackTerminalWidget: set_credentials({username}, ***, {ssh_port})")
+                
+            def connect(self):
+                logger.debug("FallbackTerminalWidget: connect() called")
+                return False, "Terminal requires SSH packages (paramiko, cryptography)"
+                
+            def clear_terminal(self):
+                logger.debug("FallbackTerminalWidget: clear_terminal()")
+                
+            def destroy(self):
+                logger.debug("FallbackTerminalWidget: destroy()")
+                
+            def send_command(self, command):
+                logger.debug(f"FallbackTerminalWidget: send_command({command})")
+                return False
+        
+        return FallbackTerminalWidget()
+
+    def _setup_ssh_requirements(self):
+        """Install SSH requirements"""
+        try:
+            import subprocess
+            import sys
+            
+            # Show progress
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Installing SSH requirements...",
+                    text_color="#F59E0B"
+                )
+            
+            requirements = ["paramiko", "cryptography", "ssh-python"]
+            results = []
+            
+            for package in requirements:
+                try:
+                    logger.info(f"Installing {package}...")
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", package],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    results.append(f"✓ {package}: {result.stdout[:100]}...")
+                except subprocess.CalledProcessError as e:
+                    results.append(f"✗ {package}: {e.stderr[:100]}...")
+            
+            # Show results
+            result_text = "\n".join(results)
+            messagebox.showinfo(
+                "Installation Results",
+                f"SSH package installation results:\n\n{result_text}",
+                parent=self
+            )
+            
+            # Reinitialize terminal
+            self._reinitialize_terminal()
+            
+        except Exception as e:
+            logger.error(f"Failed to install SSH packages: {e}")
+            messagebox.showerror(
+                "Installation Failed",
+                f"Failed to install SSH packages:\n\n{str(e)}",
+                parent=self
+            )
+
+    def _reinitialize_terminal(self):
+        """Reinitialize the terminal widget"""
+        try:
+            # Switch to terminal tab first
+            if hasattr(self, 'vm_notebook'):
+                self.vm_notebook.set("💻 SSH Terminal")
+            
+            # Clear the terminal tab
+            if hasattr(self, 'vm_terminal_tab'):
+                for widget in self.vm_terminal_tab.winfo_children():
+                    widget.destroy()
+            
+            # Recreate terminal tab
+            self._setup_vm_terminal_tab_modern()
+            
+            # Refresh VM list
+            if hasattr(self, '_refresh_terminal_vms'):
+                self._refresh_terminal_vms()
+            
+            # Show success message
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Terminal reinitialized successfully",
+                    text_color="#10B981"
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to reinitialize terminal: {e}")
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text=f"Reinitialization failed: {str(e)[:50]}...",
+                    text_color="#EF4444"
+                )
+
+    # Update the _connect_terminal method with proper checks:
+    def _connect_terminal(self):
+        """Connect terminal to selected VM"""
+        vm_name = self.terminal_vm_combo.get()
+        if not vm_name:
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Please select a VM first",
+                    text_color="#EF4444"
+                )
+            return
+        
+        # Find the VM
+        vm = None
+        for v in self.vms:
+            if v.name == vm_name:
+                vm = v
+                break
+        
+        if not vm:
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text=f"VM '{vm_name}' not found",
+                    text_color="#EF4444"
+                )
+            return
+        
+        # CRITICAL: Ensure terminal_widget exists
+        if not hasattr(self, 'terminal_widget') or self.terminal_widget is None:
+            logger.error("terminal_widget is None, attempting to reinitialize")
+            
+            # Try to reinitialize
+            self._reinitialize_terminal()
+            
+            # Wait a bit for reinitialization
+            self.after(500, lambda: self._connect_terminal_to_vm(vm))
+            return
+        
+        # Connect to VM
+        self._connect_terminal_to_vm(vm)
+
+    def _connect_terminal_to_vm(self, vm):
+        """Actual connection logic"""
+        try:
+            # Set VM info
+            self.terminal_widget.set_vm_id(vm.id)
+            self.terminal_widget.set_vm_name(vm.name)
+            self.terminal_widget.set_vm_ip(vm.ip_address)
+            
+            # Load credentials
+            try:
+                from localvm.credentials_manager import CredentialsManager
+                credentials_manager = CredentialsManager()
+                credentials = credentials_manager.get_credentials(vm.id)
+                
+                if credentials:
+                    self.terminal_widget.set_credentials(
+                        username=credentials.get('username'),
+                        password=credentials.get('password'),
+                        ssh_port=credentials.get('ssh_port', 22)
+                    )
+                else:
+                    # No credentials found, show message
+                    if hasattr(self, 'terminal_status_label'):
+                        self.terminal_status_label.configure(
+                            text=f"No SSH credentials found for {vm.name}",
+                            text_color="#F59E0B"
+                        )
+            except Exception as cred_error:
+                logger.error(f"Error loading credentials: {cred_error}")
+            
+            # Try to connect
+            success, message = self.terminal_widget.connect()
+            
+            if hasattr(self, 'terminal_status_label'):
+                if success:
+                    self.terminal_status_label.configure(
+                        text=f"Connected to {vm.name}",
+                        text_color="#10B981"
+                    )
+                else:
+                    self.terminal_status_label.configure(
+                        text=f"Connection failed: {message}",
+                        text_color="#EF4444"
+                    )
+                    
+        except AttributeError as e:
+            logger.error(f"Terminal widget method missing: {e}")
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text="Terminal widget error - missing method",
+                    text_color="#EF4444"
+                )
+            # Reinitialize terminal
+            self._reinitialize_terminal()
+            
+        except Exception as e:
+            logger.error(f"Error connecting terminal: {e}")
+            if hasattr(self, 'terminal_status_label'):
+                self.terminal_status_label.configure(
+                    text=f"Connection error: {str(e)[:50]}...",
+                    text_color="#EF4444"
+                )
+
+
+
+        
+    #######
+        
+        
+    
+
+
   
 
     
