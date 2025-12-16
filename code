@@ -8526,6 +8526,1877 @@ class MainWindow(ctk.CTk):
 
         
     #######
+
+
+
+"""
+Database Manager Dialog for LocalVM Manager
+Provides database instance management and monitoring using local database services
+"""
+import customtkinter as ctk
+from tkinter import ttk, messagebox
+import tkinter as tk
+from datetime import datetime, timedelta
+import threading
+import time
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import webbrowser
+
+# Try to import psutil, but handle if it's not installed
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+from localvm.gui.widgets import ModernButton, CardFrame, StatusBadge
+
+# Define constants at module level
+DB_TYPES = [
+    ("SQLite", "Lightweight disk-based database, no server required", "📁"),
+    ("MariaDB", "Drop-in replacement for MySQL, requires installation", "🐬"),
+    ("PostgreSQL", "Advanced open-source database, requires installation", "🐘")
+]
+
+DB_VERSIONS = {
+    "SQLite": ["3.x"],
+    "MariaDB": ["10.11", "10.6", "10.5"],
+    "PostgreSQL": ["15", "14", "13"]
+}
+
+
+class DatabaseManagerDialog(ctk.CTkToplevel):
+    """Dialog for managing database instances using local services"""
+    
+    def __init__(self, parent, database_manager):
+        super().__init__(parent)
+        
+        self.parent = parent
+        self.database_manager = database_manager
+        
+        self.title("Database Manager - LocalVM Manager")
+        self.geometry("1300x850")
+        self.resizable(True, True)
+        
+        # Initialize monitoring state
+        self.monitoring = False
+        self.monitor_thread = None
+        
+        # Configure grid
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        
+        # Create widgets
+        self._create_widgets()
+        
+        # Load initial data
+        self._load_database_instances()
+        self._load_backups_list()
+        self._update_service_status()
+        
+        # Start monitoring
+        self._start_monitoring()
+        
+        # Center window
+        self._center_window()
+        
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+    
+    def _create_widgets(self):
+        """Create all database manager widgets"""
+        
+        # Header frame
+        header_frame = ctk.CTkFrame(self, height=80)
+        header_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        header_frame.grid_columnconfigure(0, weight=1)
+        
+        # Title
+        ctk.CTkLabel(
+            header_frame,
+            text="Local Database Manager",
+            font=ctk.CTkFont(size=24, weight="bold")
+        ).pack(side="left", padx=20, pady=10)
+        
+        # Stats
+        stats_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        stats_frame.pack(side="right", padx=20, pady=10)
+        
+        self.stats_label = ctk.CTkLabel(
+            stats_frame,
+            text="Databases: 0",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        )
+        self.stats_label.pack(side="left", padx=(0, 20))
+        
+        # Service status indicator
+        self.service_status_label = ctk.CTkLabel(
+            stats_frame,
+            text="Services: Checking...",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        )
+        self.service_status_label.pack(side="left", padx=(0, 20))
+        
+        # Create database button
+        ModernButton(
+            header_frame,
+            text="+ Create Database",
+            command=self._show_create_database_dialog,
+            width=150,
+            fg_color="#10B981",
+            hover_color="#059669"
+        ).pack(side="right", padx=(0, 10))
+        
+        # Main content - Notebook for tabs
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        
+        # Create tabs
+        self._create_databases_tab()
+        self._create_query_tab()
+        self._create_backups_tab()
+        self._create_tools_tab()
+        self._create_settings_tab()
+        
+        # Status bar
+        self.status_bar = ctk.CTkFrame(self, height=30)
+        self.status_bar.grid(row=2, column=0, padx=20, pady=(0, 20), sticky="ew")
+        
+        self.status_text = ctk.CTkLabel(
+            self.status_bar,
+            text="Ready",
+            font=ctk.CTkFont(size=10)
+        )
+        self.status_text.pack(side="left", padx=10, pady=5)
+    
+    def _create_databases_tab(self):
+        """Create database instances tab"""
+        frame = ctk.CTkFrame(self.notebook)
+        self.notebook.add(frame, text="Databases")
+        
+        # Configure grid
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+        
+        # Toolbar
+        toolbar = ctk.CTkFrame(frame, height=50)
+        toolbar.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        
+        # Search
+        search_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
+        search_frame.pack(side="left", padx=20, pady=10)
+        
+        ctk.CTkLabel(search_frame, text="Search:").pack(side="left", padx=(0, 10))
+        self.search_entry = ctk.CTkEntry(
+            search_frame,
+            width=200,
+            placeholder_text="Database name..."
+        )
+        self.search_entry.pack(side="left")
+        self.search_entry.bind("<Return>", lambda e: self._filter_databases())
+        
+        # Action buttons
+        action_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
+        action_frame.pack(side="right", padx=20, pady=10)
+        
+        ModernButton(
+            action_frame,
+            text="Refresh",
+            command=self._load_database_instances,
+            width=100
+        ).pack(side="left", padx=(0, 10))
+        
+        ModernButton(
+            action_frame,
+            text="Install MariaDB",
+            command=lambda: self._install_service("mariadb"),
+            width=120,
+            fg_color="#F59E0B",
+            hover_color="#D97706"
+        ).pack(side="left")
+        
+        # Database instances list
+        list_frame = ctk.CTkFrame(frame)
+        list_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
+        
+        # Treeview for databases
+        columns = ("name", "type", "size", "tables", "created", "status", "actions")
+        self.db_tree = ttk.Treeview(
+            list_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse"
+        )
+        
+        # Define headings
+        headings = [
+            ("Name", 150),
+            ("Type", 100),
+            ("Size", 100),
+            ("Tables", 80),
+            ("Created", 120),
+            ("Status", 100),
+            ("Actions", 200)
+        ]
+        
+        for col, (text, width) in zip(columns, headings):
+            self.db_tree.heading(col, text=text)
+            self.db_tree.column(col, width=width, minwidth=width)
+        
+        # Style the treeview
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=30)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.db_tree.yview)
+        self.db_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack
+        self.db_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Bind events
+        self.db_tree.bind("<Double-1>", self._on_database_double_click)
+    
+    def _create_query_tab(self):
+        """Create SQL query tab"""
+        frame = ctk.CTkFrame(self.notebook)
+        self.notebook.add(frame, text="SQL Query")
+        
+        # Configure grid
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+        frame.grid_rowconfigure(2, weight=2)
+        
+        # Database selector
+        selector_frame = ctk.CTkFrame(frame, height=50)
+        selector_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        
+        ctk.CTkLabel(selector_frame, text="Database:").pack(side="left", padx=(20, 10))
+        
+        self.query_db_combo = ctk.CTkComboBox(
+            selector_frame,
+            values=[],
+            width=200,
+            command=self._on_query_db_selected
+        )
+        self.query_db_combo.pack(side="left", padx=(0, 10))
+        
+        # Query type selector
+        ctk.CTkLabel(selector_frame, text="Query Type:").pack(side="left", padx=(20, 10))
+        
+        self.query_type_combo = ctk.CTkComboBox(
+            selector_frame,
+            values=["Custom", "Select All", "Show Tables", "Show Schema"],
+            width=120
+        )
+        self.query_type_combo.pack(side="left", padx=(0, 10))
+        self.query_type_combo.set("Custom")
+        self.query_type_combo.configure(command=self._on_query_type_selected)
+        
+        ModernButton(
+            selector_frame,
+            text="Execute",
+            command=self._execute_query,
+            width=100,
+            fg_color="#3B82F6",
+            hover_color="#2563EB"
+        ).pack(side="right", padx=20)
+        
+        # Query editor
+        query_frame = ctk.CTkFrame(frame)
+        query_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        query_frame.grid_columnconfigure(0, weight=1)
+        query_frame.grid_rowconfigure(0, weight=1)
+        
+        # SQL editor
+        self.query_text = ctk.CTkTextbox(query_frame, font=("Consolas", 11))
+        self.query_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.query_text.insert("1.0", "-- Enter SQL query here\nSELECT * FROM sqlite_master WHERE type='table';")
+        
+        # Results frame
+        results_frame = ctk.CTkFrame(frame, height=200)
+        results_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        results_frame.grid_columnconfigure(0, weight=1)
+        results_frame.grid_rowconfigure(0, weight=1)
+        
+        ctk.CTkLabel(
+            results_frame,
+            text="Query Results",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(anchor="w", padx=10, pady=5)
+        
+        # Results treeview
+        self.results_tree = ttk.Treeview(results_frame, show="headings")
+        self.results_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        # Add scrollbar to results
+        results_scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.results_tree.yview)
+        self.results_tree.configure(yscrollcommand=results_scrollbar.set)
+        results_scrollbar.pack(side="right", fill="y")
+        
+        # Status label
+        self.query_status = ctk.CTkLabel(
+            results_frame,
+            text="Ready",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        )
+        self.query_status.pack(anchor="w", padx=10, pady=(0, 5))
+    
+    def _create_backups_tab(self):
+        """Create database backups tab"""
+        frame = ctk.CTkFrame(self.notebook)
+        self.notebook.add(frame, text="Backups")
+        
+        # Configure grid
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+        
+        # Toolbar
+        toolbar = ctk.CTkFrame(frame, height=50)
+        toolbar.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        
+        ctk.CTkLabel(
+            toolbar,
+            text="Database Backups",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(side="left", padx=20, pady=10)
+        
+        ModernButton(
+            toolbar,
+            text="+ Create Backup",
+            command=self._create_backup,
+            width=150,
+            fg_color="#10B981",
+            hover_color="#059669"
+        ).pack(side="right", padx=20, pady=10)
+        
+        # Backups list
+        list_frame = ctk.CTkFrame(frame)
+        list_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
+        
+        # Treeview for backups
+        columns = ("database", "backup_name", "created", "size", "actions")
+        self.backup_tree = ttk.Treeview(
+            list_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse"
+        )
+        
+        # Define headings
+        headings = [
+            ("Database", 200),
+            ("Backup Name", 200),
+            ("Created", 150),
+            ("Size", 100),
+            ("Actions", 150)
+        ]
+        
+        for col, (text, width) in zip(columns, headings):
+            self.backup_tree.heading(col, text=text)
+            self.backup_tree.column(col, width=width)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.backup_tree.yview)
+        self.backup_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack
+        self.backup_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+    
+    def _create_tools_tab(self):
+        """Create database tools tab"""
+        frame = ctk.CTkFrame(self.notebook)
+        self.notebook.add(frame, text="Tools")
+        
+        # Configure grid
+        for i in range(2):
+            frame.grid_columnconfigure(i, weight=1)
+        for i in range(3):
+            frame.grid_rowconfigure(i, weight=1)
+        
+        # Service Status Card
+        service_card = CardFrame(frame, height=150)
+        service_card.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        
+        ctk.CTkLabel(
+            service_card,
+            text="Database Services",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        self.service_status_frame = ctk.CTkFrame(service_card, fg_color="transparent")
+        self.service_status_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        
+        # Database Info Card
+        info_card = CardFrame(frame, height=150)
+        info_card.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        
+        ctk.CTkLabel(
+            info_card,
+            text="Database Information",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        self.info_label = ctk.CTkLabel(
+            info_card,
+            text="Total Databases: 0\nTotal Size: 0 KB",
+            font=ctk.CTkFont(size=12)
+        )
+        self.info_label.pack(expand=True)
+        
+        # Optimize Database Card
+        optimize_card = CardFrame(frame, height=150)
+        optimize_card.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        
+        ctk.CTkLabel(
+            optimize_card,
+            text="Optimize Database",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        ctk.CTkLabel(
+            optimize_card,
+            text="Repair and optimize database files",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+        
+        ModernButton(
+            optimize_card,
+            text="Optimize All",
+            command=self._optimize_all_databases,
+            width=120
+        ).pack(anchor="w", padx=20)
+        
+        # Import/Export Card
+        import_card = CardFrame(frame, height=150)
+        import_card.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
+        
+        ctk.CTkLabel(
+            import_card,
+            text="Import/Export",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        button_frame = ctk.CTkFrame(import_card, fg_color="transparent")
+        button_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        
+        ModernButton(
+            button_frame,
+            text="Import CSV",
+            command=self._import_csv,
+            width=120
+        ).pack(pady=5)
+        
+        ModernButton(
+            button_frame,
+            text="Export to CSV",
+            command=self._export_csv,
+            width=120
+        ).pack(pady=5)
+        
+        # Quick Actions Card
+        quick_card = CardFrame(frame, height=150)
+        quick_card.grid(row=2, column=0, columnspan=2, padx=10, pady=10, sticky="nsew")
+        
+        ctk.CTkLabel(
+            quick_card,
+            text="Quick Actions",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        quick_actions_frame = ctk.CTkFrame(quick_card, fg_color="transparent")
+        quick_actions_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        actions = [
+            ("Verify All Databases", self._verify_all_databases),
+            ("Clean Old Backups", self._clean_old_backups),
+            ("Update Statistics", self._update_statistics),
+            ("Test Connections", self._test_connections)
+        ]
+        
+        for i, (text, command) in enumerate(actions):
+            ModernButton(
+                quick_actions_frame,
+                text=text,
+                command=command,
+                width=150
+            ).grid(row=i//2, column=i%2, padx=5, pady=5, sticky="ew")
+    
+    def _create_settings_tab(self):
+        """Create database settings tab"""
+        frame = ctk.CTkFrame(self.notebook)
+        self.notebook.add(frame, text="Settings")
+        
+        # Settings container
+        settings_frame = CardFrame(frame)
+        settings_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(
+            settings_frame,
+            text="Database Settings",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+        
+        # Storage settings
+        storage_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        storage_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(
+            storage_frame,
+            text="Storage Path:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=120
+        ).pack(side="left")
+        
+        self.storage_path_label = ctk.CTkLabel(
+            storage_frame,
+            text=str(getattr(self.database_manager, 'config_dir', 'Not set')),
+            font=ctk.CTkFont(size=12, family="Consolas")
+        )
+        self.storage_path_label.pack(side="left", fill="x", expand=True)
+        
+        ModernButton(
+            storage_frame,
+            text="Change",
+            command=self._change_storage_path,
+            width=80
+        ).pack(side="right", padx=(10, 0))
+        
+        # Auto-backup settings
+        backup_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        backup_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(
+            backup_frame,
+            text="Auto-backup:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=120
+        ).pack(side="left")
+        
+        self.auto_backup_var = tk.BooleanVar(value=getattr(self.database_manager, 'auto_backup', True))
+        ctk.CTkCheckBox(
+            backup_frame,
+            text="Enable automatic backups",
+            variable=self.auto_backup_var,
+            font=ctk.CTkFont(size=12)
+        ).pack(side="left")
+        
+        # Backup retention
+        retention_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        retention_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(
+            retention_frame,
+            text="Backup Retention:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=120
+        ).pack(side="left")
+        
+        self.retention_combo = ctk.CTkComboBox(
+            retention_frame,
+            values=["7 days", "14 days", "30 days", "90 days"],
+            width=120
+        )
+        self.retention_combo.pack(side="left")
+        self.retention_combo.set("30 days")
+        
+        # Default database type
+        default_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        default_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(
+            default_frame,
+            text="Default Type:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=120
+        ).pack(side="left")
+        
+        self.default_type_combo = ctk.CTkComboBox(
+            default_frame,
+            values=[db[0] for db in DB_TYPES],
+            width=150
+        )
+        self.default_type_combo.pack(side="left")
+        self.default_type_combo.set("SQLite")
+        
+        # Save button
+        button_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        button_frame.pack(fill="x", padx=20, pady=20)
+        
+        ModernButton(
+            button_frame,
+            text="Save Settings",
+            command=self._save_settings,
+            width=150,
+            fg_color="#3B82F6",
+            hover_color="#2563EB"
+        ).pack()
+    
+    def _start_monitoring(self):
+        """Start database monitoring"""
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self._monitor_databases, daemon=True)
+        self.monitor_thread.start()
+    
+    def _monitor_databases(self):
+        """Monitor database instances"""
+        while self.monitoring:
+            try:
+                if self.winfo_exists():  # Check if window still exists
+                    # Refresh database list periodically
+                    self.after(100, self._load_database_instances)
+                    self.after(100, self._update_service_status)
+                    self.after(100, self._update_database_info)
+                    
+                time.sleep(10)  # Update every 10 seconds
+                
+            except Exception as e:
+                print(f"Database monitoring error: {e}")
+                break
+    
+    def _load_database_instances(self):
+        """Load database instances into treeview"""
+        try:
+            if not self.winfo_exists():
+                return
+            
+            # Clear existing items
+            for item in self.db_tree.get_children():
+                self.db_tree.delete(item)
+            
+            # Get instances from database manager
+            instances = self.database_manager.get_all_instances()
+            
+            # Add instances to tree
+            for instance in instances:
+                # Format size
+                size_bytes = instance.get('size', 0)
+                if size_bytes < 1024:
+                    size_text = f"{size_bytes} B"
+                elif size_bytes < 1024 * 1024:
+                    size_text = f"{size_bytes/1024:.1f} KB"
+                else:
+                    size_text = f"{size_bytes/(1024*1024):.1f} MB"
+                
+                # Get status
+                accessible = instance.get('accessible', False)
+                status = "🟢 Online" if accessible else "🔴 Offline"
+                
+                self.db_tree.insert("", "end", values=(
+                    instance.get('name', 'Unknown'),
+                    instance.get('type', 'Unknown').upper(),
+                    size_text,
+                    str(instance.get('table_count', 0)),
+                    instance.get('created', 'N/A')[:10],
+                    status,
+                    "🔍🗑"  # Action icons: View, Delete
+                ))
+            
+            # Update stats label
+            total_instances = len(instances)
+            self.stats_label.configure(
+                text=f"Databases: {total_instances}"
+            )
+            
+            # Update query database combo
+            db_names = [instance.get('name', '') for instance in instances]
+            self.query_db_combo.configure(values=db_names)
+            if db_names and not self.query_db_combo.get():
+                self.query_db_combo.set(db_names[0])
+            
+        except Exception as e:
+            print(f"Error loading database instances: {e}")
+    
+    def _update_service_status(self):
+        """Update service status display"""
+        try:
+            # Clear existing widgets
+            for widget in self.service_status_frame.winfo_children():
+                widget.destroy()
+            
+            # Get service status for each database type
+            service_status = {}
+            for db_type in ["sqlite", "mariadb", "postgresql"]:
+                if hasattr(self.database_manager, 'get_service_status'):
+                    status = self.database_manager.get_service_status(db_type)
+                    service_status[db_type] = status
+            
+            # Display status
+            for db_type, status in service_status.items():
+                frame = ctk.CTkFrame(self.service_status_frame, fg_color="transparent")
+                frame.pack(fill="x", pady=2)
+                
+                # Database type
+                db_name = db_type.capitalize()
+                if db_type == "mariadb":
+                    db_name = "MariaDB"
+                elif db_type == "postgresql":
+                    db_name = "PostgreSQL"
+                
+                ctk.CTkLabel(
+                    frame,
+                    text=f"{db_name}:",
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    width=80
+                ).pack(side="left")
+                
+                # Status indicator
+                if status.get('installed', False):
+                    if status.get('running', False):
+                        status_text = "🟢 Running"
+                        status_color = "#10B981"
+                    else:
+                        status_text = "🟡 Installed (Stopped)"
+                        status_color = "#F59E0B"
+                else:
+                    status_text = "🔴 Not Installed"
+                    status_color = "#EF4444"
+                
+                ctk.CTkLabel(
+                    frame,
+                    text=status_text,
+                    font=ctk.CTkFont(size=11),
+                    text_color=status_color
+                ).pack(side="left", padx=(10, 0))
+            
+            # Update header status with psutil warning if needed
+            if not PSUTIL_AVAILABLE:
+                self.service_status_label.configure(
+                    text="Services: psutil not installed"
+                )
+            else:
+                total_services = len(service_status)
+                running_services = sum(1 for s in service_status.values() if s.get('running', False))
+                self.service_status_label.configure(
+                    text=f"Services: {running_services}/{total_services}"
+                )
+                
+        except Exception as e:
+            print(f"Error updating service status: {e}")
+    
+    def _update_database_info(self):
+        """Update database information display"""
+        try:
+            instances = self.database_manager.get_all_instances()
+            total_size = sum(instance.get('size', 0) for instance in instances)
+            
+            if total_size < 1024:
+                size_text = f"{total_size} B"
+            elif total_size < 1024 * 1024:
+                size_text = f"{total_size/1024:.1f} KB"
+            else:
+                size_text = f"{total_size/(1024*1024):.1f} MB"
+            
+            self.info_label.configure(
+                text=f"Total Databases: {len(instances)}\nTotal Size: {size_text}"
+            )
+            
+        except Exception as e:
+            print(f"Error updating database info: {e}")
+    
+    def _filter_databases(self, event=None):
+        """Filter database instances based on search"""
+        search_term = self.search_entry.get().strip().lower()
+        
+        if not search_term:
+            # Show all items
+            for item in self.db_tree.get_children():
+                self.db_tree.detach(item)
+            for item in self.db_tree.get_children():
+                self.db_tree.reattach(item, "", "end")
+            return
+        
+        # Show all items first
+        for item in self.db_tree.get_children():
+            self.db_tree.detach(item)
+        
+        # Re-attach filtered items
+        for item in self.db_tree.get_children():
+            values = self.db_tree.item(item)["values"]
+            if not values:
+                continue
+            
+            name = values[0].lower()
+            
+            # Apply search filter
+            if search_term in name:
+                self.db_tree.reattach(item, "", "end")
+    
+    def _on_database_double_click(self, event):
+        """Handle double-click on database instance"""
+        item = self.db_tree.selection()
+        if item:
+            values = self.db_tree.item(item)["values"]
+            if values:
+                db_name = values[0]
+                self._show_database_details(db_name)
+    
+    def _show_create_database_dialog(self):
+        """Show create database dialog"""
+        dialog = CreateDatabaseDialog(self, self.database_manager)
+        self.wait_window(dialog)
+        
+        if dialog.result:
+            self._load_database_instances()
+    
+    def _show_database_details(self, db_name: str):
+        """Show database instance details"""
+        dialog = DatabaseInstanceDialog(self, self.database_manager, db_name)
+        self.wait_window(dialog)
+    
+    def _on_query_db_selected(self, choice):
+        """Handle database selection in query tab"""
+        # Update query text with sample query for selected database
+        if choice:
+            sample_query = f"-- Querying database: {choice}\nSELECT * FROM sqlite_master WHERE type='table';"
+            self.query_text.delete("1.0", "end")
+            self.query_text.insert("1.0", sample_query)
+    
+    def _on_query_type_selected(self, choice):
+        """Handle query type selection"""
+        db_name = self.query_db_combo.get()
+        if not db_name:
+            return
+        
+        if choice == "Select All":
+            # Get tables from database
+            tables = self.database_manager.get_tables(db_name)
+            if tables:
+                table_names = [table['name'] for table in tables]
+                if table_names:
+                    query = f"SELECT * FROM {table_names[0]} LIMIT 10;"
+                    self.query_text.delete("1.0", "end")
+                    self.query_text.insert("1.0", query)
+        
+        elif choice == "Show Tables":
+            query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+            self.query_text.delete("1.0", "end")
+            self.query_text.insert("1.0", query)
+        
+        elif choice == "Show Schema":
+            query = "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
+            self.query_text.delete("1.0", "end")
+            self.query_text.insert("1.0", query)
+    
+    def _execute_query(self):
+        """Execute SQL query"""
+        db_name = self.query_db_combo.get()
+        query = self.query_text.get("1.0", "end-1c").strip()
+        
+        if not db_name:
+            messagebox.showwarning("No Database", "Please select a database first")
+            return
+        
+        if not query:
+            messagebox.showwarning("No Query", "Please enter a SQL query")
+            return
+        
+        try:
+            # Clear previous results
+            for item in self.results_tree.get_children():
+                self.results_tree.delete(item)
+            self.results_tree["columns"] = ()
+            
+            # Execute query
+            results, columns, error = self.database_manager.execute_query(db_name, query)
+            
+            if error:
+                self.query_status.configure(text=f"❌ Error: {error}", text_color="#EF4444")
+                return
+            
+            if columns:
+                # Set up columns
+                self.results_tree["columns"] = columns
+                for col in columns:
+                    self.results_tree.heading(col, text=col)
+                    self.results_tree.column(col, width=100, anchor="w")
+                
+                # Add rows
+                for row in results:
+                    self.results_tree.insert("", "end", values=row)
+                
+                self.query_status.configure(
+                    text=f"✅ Query executed successfully. {len(results)} row(s) returned.",
+                    text_color="#10B981"
+                )
+            else:
+                # Non-select query (INSERT, UPDATE, DELETE, etc.)
+                self.query_status.configure(
+                    text=f"✅ Query executed successfully. {results[0][0] if results else 0} row(s) affected.",
+                    text_color="#10B981"
+                )
+            
+        except Exception as e:
+            self.query_status.configure(text=f"❌ Error: {str(e)}", text_color="#EF4444")
+    
+    def _create_backup(self):
+        """Create database backup"""
+        # Get selected database
+        item = self.db_tree.selection()
+        if not item:
+            messagebox.showwarning("No Selection", "Please select a database to backup")
+            return
+        
+        values = self.db_tree.item(item)["values"]
+        if not values:
+            return
+        
+        db_name = values[0]
+        
+        # Create backup
+        success, message = self.database_manager.create_backup(db_name)
+        if success:
+            messagebox.showinfo("Backup Created", message)
+            self._load_backups_list()
+        else:
+            messagebox.showerror("Backup Failed", message)
+    
+    def _load_backups_list(self):
+        """Load backups into treeview"""
+        try:
+            # Clear existing items
+            for item in self.backup_tree.get_children():
+                self.backup_tree.delete(item)
+            
+            # Load backups from backup directory
+            backups_dir = getattr(self.database_manager, 'backups_dir', None)
+            if backups_dir and os.path.exists(backups_dir):
+                for backup_file in os.listdir(backups_dir):
+                    if backup_file.endswith('.db'):
+                        backup_path = os.path.join(backups_dir, backup_file)
+                        try:
+                            created = datetime.fromtimestamp(
+                                os.path.getctime(backup_path)
+                            ).strftime("%Y-%m-%d %H:%M")
+                            
+                            size = os.path.getsize(backup_path)
+                            if size < 1024:
+                                size_text = f"{size} B"
+                            elif size < 1024 * 1024:
+                                size_text = f"{size/1024:.1f} KB"
+                            else:
+                                size_text = f"{size/(1024*1024):.1f} MB"
+                            
+                            # Extract database name from backup filename
+                            backup_name = backup_file.replace('.db', '')
+                            if '_backup_' in backup_name:
+                                db_name = backup_name.split('_backup_')[0]
+                            else:
+                                db_name = backup_name
+                            
+                            self.backup_tree.insert("", "end", values=(
+                                db_name,
+                                backup_name,
+                                created,
+                                size_text,
+                                "↻🗑"  # Restore, Delete
+                            ))
+                            
+                        except Exception as e:
+                            print(f"Error loading backup {backup_file}: {e}")
+                        
+        except Exception as e:
+            print(f"Error loading backups: {e}")
+    
+    def _install_service(self, service_type: str):
+        """Install database service"""
+        try:
+            if hasattr(self.database_manager, 'install_service'):
+                success, message = self.database_manager.install_service(service_type)
+                
+                if not success:
+                    # Show installation instructions
+                    dialog = ctk.CTkToplevel(self)
+                    dialog.title(f"Install {service_type.capitalize()}")
+                    dialog.geometry("600x400")
+                    dialog.resizable(False, False)
+                    
+                    # Instructions
+                    ctk.CTkLabel(
+                        dialog,
+                        text=f"Install {service_type.capitalize()}",
+                        font=ctk.CTkFont(size=20, weight="bold")
+                    ).pack(pady=20)
+                    
+                    # Message
+                    text_widget = ctk.CTkTextbox(dialog, height=200)
+                    text_widget.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+                    text_widget.insert("1.0", message)
+                    text_widget.configure(state="disabled")
+                    
+                    # Download button
+                    if service_type == "mariadb":
+                        ModernButton(
+                            dialog,
+                            text="Open Download Page",
+                            command=lambda: webbrowser.open("https://mariadb.org/download/"),
+                            width=150
+                        ).pack(pady=(0, 20))
+                    
+                    ModernButton(
+                        dialog,
+                        text="Close",
+                        command=dialog.destroy,
+                        width=100
+                    ).pack(pady=(0, 20))
+                    
+                    dialog.grab_set()
+                else:
+                    messagebox.showinfo("Success", message)
+                    
+            else:
+                messagebox.showwarning("Not Supported", "Service installation not supported")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to install service: {str(e)}")
+    
+    def _optimize_all_databases(self):
+        """Optimize all databases"""
+        instances = self.database_manager.get_all_instances()
+        
+        if not instances:
+            messagebox.showinfo("No Databases", "No databases to optimize")
+            return
+        
+        optimized = 0
+        errors = []
+        
+        for instance in instances:
+            db_name = instance.get('name')
+            try:
+                success, message = self.database_manager.optimize_database(db_name)
+                if success:
+                    optimized += 1
+                else:
+                    errors.append(f"{db_name}: {message}")
+            except Exception as e:
+                errors.append(f"{db_name}: {str(e)}")
+        
+        if errors:
+            messagebox.showwarning("Optimization Results", 
+                f"Optimized {optimized}/{len(instances)} databases.\n\nErrors:\n" + "\n".join(errors[:5]))
+        else:
+            messagebox.showinfo("Success", f"All {optimized} databases optimized successfully")
+    
+    def _import_csv(self):
+        """Import CSV data"""
+        from tkinter import filedialog
+        
+        file_path = filedialog.askopenfilename(
+            title="Select CSV File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        
+        if file_path:
+            # Get selected database
+            item = self.db_tree.selection()
+            if not item:
+                messagebox.showwarning("No Database", "Please select a database first")
+                return
+            
+            values = self.db_tree.item(item)["values"]
+            if not values:
+                return
+            
+            db_name = values[0]
+            
+            # Ask for table name
+            table_name = tk.simpledialog.askstring(
+                "Table Name",
+                "Enter table name for imported data:",
+                parent=self
+            )
+            
+            if table_name:
+                try:
+                    success, message = self.database_manager.import_data(db_name, file_path, table_name)
+                    if success:
+                        messagebox.showinfo("Success", message)
+                        self._load_database_instances()
+                    else:
+                        messagebox.showerror("Error", message)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to import CSV: {str(e)}")
+    
+    def _export_csv(self):
+        """Export data to CSV"""
+        # Get selected database
+        item = self.db_tree.selection()
+        if not item:
+            messagebox.showwarning("No Database", "Please select a database first")
+            return
+        
+        values = self.db_tree.item(item)["values"]
+        if not values:
+            return
+        
+        db_name = values[0]
+        
+        # Get tables from database
+        tables = self.database_manager.get_tables(db_name)
+        if not tables:
+            messagebox.showinfo("No Tables", "Database has no tables to export")
+            return
+        
+        # Ask for table name
+        table_names = [table['name'] for table in tables]
+        table_name = tk.simpledialog.askstring(
+            "Table Name",
+            f"Enter table name to export from {db_name}:",
+            parent=self
+        )
+        
+        if table_name:
+            if table_name not in table_names:
+                messagebox.showwarning("Invalid Table", f"Table '{table_name}' not found")
+                return
+            
+            # Ask for save location
+            from tkinter import filedialog
+            save_path = filedialog.asksaveasfilename(
+                title="Save CSV As",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            )
+            
+            if save_path:
+                try:
+                    success, message = self.database_manager.export_data(db_name, table_name, "csv")
+                    if success:
+                        messagebox.showinfo("Success", f"Data exported to {save_path}")
+                    else:
+                        messagebox.showerror("Error", message)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to export CSV: {str(e)}")
+    
+    def _verify_all_databases(self):
+        """Verify all databases"""
+        instances = self.database_manager.get_all_instances()
+        
+        if not instances:
+            messagebox.showinfo("No Databases", "No databases to verify")
+            return
+        
+        verified = 0
+        errors = []
+        
+        for instance in instances:
+            db_name = instance.get('name')
+            accessible = instance.get('accessible', False)
+            
+            if accessible:
+                verified += 1
+            else:
+                errors.append(f"{db_name}: Not accessible")
+        
+        if errors:
+            messagebox.showwarning("Verification Results", 
+                f"Verified {verified}/{len(instances)} databases.\n\nErrors:\n" + "\n".join(errors[:5]))
+        else:
+            messagebox.showinfo("Success", f"All {verified} databases verified and accessible")
+    
+    def _clean_old_backups(self):
+        """Clean old backups"""
+        try:
+            backups_dir = getattr(self.database_manager, 'backups_dir', None)
+            if not backups_dir or not os.path.exists(backups_dir):
+                messagebox.showinfo("No Backups", "No backups directory found")
+                return
+            
+            # Get retention period
+            retention = self.retention_combo.get()
+            if retention == "7 days":
+                days = 7
+            elif retention == "14 days":
+                days = 14
+            elif retention == "30 days":
+                days = 30
+            elif retention == "90 days":
+                days = 90
+            else:
+                days = 30
+            
+            cutoff_time = time.time() - (days * 24 * 3600)
+            deleted = 0
+            
+            for backup_file in os.listdir(backups_dir):
+                backup_path = os.path.join(backups_dir, backup_file)
+                if os.path.getctime(backup_path) < cutoff_time:
+                    try:
+                        os.remove(backup_path)
+                        deleted += 1
+                    except:
+                        pass
+            
+            self._load_backups_list()
+            messagebox.showinfo("Cleanup Complete", f"Deleted {deleted} old backup(s)")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to clean backups: {str(e)}")
+    
+    def _update_statistics(self):
+        """Update database statistics"""
+        messagebox.showinfo("Update Statistics", 
+            "Database statistics would be updated here.\n\n"
+            "This feature analyzes table sizes, row counts, and performance metrics.")
+    
+    def _test_connections(self):
+        """Test database connections"""
+        instances = self.database_manager.get_all_instances()
+        
+        if not instances:
+            messagebox.showinfo("No Databases", "No databases to test")
+            return
+        
+        results = []
+        for instance in instances:
+            db_name = instance.get('name')
+            accessible = instance.get('accessible', False)
+            
+            if accessible:
+                results.append(f"✅ {db_name}: Connected")
+            else:
+                results.append(f"❌ {db_name}: Not accessible")
+        
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Connection Test Results")
+        dialog.geometry("500x400")
+        dialog.resizable(False, False)
+        
+        ctk.CTkLabel(
+            dialog,
+            text="Connection Test Results",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(pady=20)
+        
+        text_widget = ctk.CTkTextbox(dialog, height=250)
+        text_widget.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        text_widget.insert("1.0", "\n".join(results))
+        text_widget.configure(state="disabled")
+        
+        ModernButton(
+            dialog,
+            text="Close",
+            command=dialog.destroy,
+            width=100
+        ).pack(pady=(0, 20))
+        
+        dialog.grab_set()
+    
+    def _change_storage_path(self):
+        """Change storage path"""
+        from tkinter import filedialog
+        
+        new_path = filedialog.askdirectory(
+            title="Select Database Storage Directory"
+        )
+        
+        if new_path:
+            self.storage_path_label.configure(text=new_path)
+            messagebox.showinfo("Storage Path", 
+                f"Storage path changed to:\n{new_path}\n\n"
+                "Note: You need to restart the application for changes to take effect.")
+    
+    def _save_settings(self):
+        """Save database settings"""
+        try:
+            # Update auto-backup setting
+            if hasattr(self.database_manager, 'auto_backup'):
+                self.database_manager.auto_backup = self.auto_backup_var.get()
+            
+            messagebox.showinfo("Settings Saved", 
+                "Database settings saved successfully")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
+    
+    def _center_window(self):
+        """Center the window on screen"""
+        self.update_idletasks()
+        
+        # Get the requested size of the window
+        width = self.winfo_reqwidth()
+        height = self.winfo_reqheight()
+        
+        # If we don't have valid dimensions yet, use the geometry string
+        if width <= 1 or height <= 1:
+            # Parse the geometry string "WxH" or use defaults
+            geometry = self.geometry()
+            if 'x' in geometry:
+                width, height = map(int, geometry.split('+')[0].split('x'))
+            else:
+                # Use default size
+                width = 1300
+                height = 850
+        
+        # Calculate position
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        
+        x = (screen_width // 2) - (width // 2)
+        y = (screen_height // 2) - (height // 2)
+        
+        # Set geometry
+        self.geometry(f'{width}x{height}+{x}+{y}')
+    
+    def on_close(self):
+        """Handle window close"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=2)
+        
+        self.destroy()
+
+
+class CreateDatabaseDialog(ctk.CTkToplevel):
+    """Dialog for creating new database instance"""
+    
+    def __init__(self, parent, database_manager):
+        super().__init__(parent)
+        
+        self.database_manager = database_manager
+        self.result = False
+        
+        self.title("Create Database")
+        self.geometry("500x500")  # Increased height to accommodate more fields
+        self.resizable(False, False)
+        
+        self._create_widgets()
+        self._center_window()
+        
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+    
+    def _create_widgets(self):
+        """Create dialog widgets"""
+        
+        # Main frame
+        main_frame = ctk.CTkFrame(self)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Title
+        ctk.CTkLabel(
+            main_frame,
+            text="Create New Database",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(pady=(0, 20))
+        
+        # Database name
+        ctk.CTkLabel(
+            main_frame,
+            text="Database Name:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(0, 5))
+        
+        self.name_entry = ctk.CTkEntry(
+            main_frame,
+            placeholder_text="e.g., mydatabase"
+        )
+        self.name_entry.pack(fill="x", padx=20, pady=(0, 15))
+        
+        # Database type
+        ctk.CTkLabel(
+            main_frame,
+            text="Database Type:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(0, 5))
+        
+        self.type_combo = ctk.CTkComboBox(
+            main_frame,
+            values=[db[0] for db in DB_TYPES],
+            width=200,
+            command=self._on_type_changed
+        )
+        self.type_combo.pack(anchor="w", padx=20, pady=(0, 15))
+        self.type_combo.set("SQLite")
+        
+        # Type description
+        self.type_desc_label = ctk.CTkLabel(
+            main_frame,
+            text="Lightweight disk-based database, no server required",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            wraplength=400
+        )
+        self.type_desc_label.pack(anchor="w", padx=20, pady=(0, 15))
+        
+        # Service status for non-SQLite databases
+        self.service_status_label = ctk.CTkLabel(
+            main_frame,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="green"
+        )
+        self.service_status_label.pack(anchor="w", padx=20, pady=(0, 15))
+        
+        # Database version (for MariaDB/PostgreSQL)
+        self.version_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        self.version_frame.pack(fill="x", padx=20, pady=(0, 15))
+        
+        ctk.CTkLabel(
+            self.version_frame,
+            text="Version:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=80
+        ).pack(side="left")
+        
+        # Version options based on database type
+        self.version_combo = ctk.CTkComboBox(
+            self.version_frame,
+            values=["Latest"],
+            width=120
+        )
+        self.version_combo.pack(side="left")
+        self.version_combo.set("Latest")
+        
+        # Location (optional)
+        ctk.CTkLabel(
+            main_frame,
+            text="Location (optional):",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(0, 5))
+        
+        loc_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        loc_frame.pack(fill="x", padx=20, pady=(0, 15))
+        
+        self.location_entry = ctk.CTkEntry(
+            loc_frame,
+            placeholder_text="Leave empty for default location"
+        )
+        self.location_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+        ModernButton(
+            loc_frame,
+            text="Browse",
+            command=self._browse_location,
+            width=80
+        ).pack(side="right")
+        
+        # Buttons
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(side="bottom", fill="x", padx=20, pady=(0, 10))
+        
+        ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=self.on_close,
+            width=100
+        ).pack(side="right", padx=(10, 0))
+        
+        ModernButton(
+            button_frame,
+            text="Create Database",
+            command=self.create_database,
+            width=150,
+            fg_color="#10B981",
+            hover_color="#059669"
+        ).pack(side="right")
+    
+    def _on_type_changed(self, choice):
+        """Handle database type change"""
+        # Update description
+        for db_type, desc, _ in DB_TYPES:
+            if db_type == choice:
+                self.type_desc_label.configure(text=desc)
+                break
+        
+        # Update service status and version options
+        if choice != "SQLite":
+            db_type_lower = choice.lower()
+            
+            # Show version selector for non-SQLite databases
+            self.version_frame.pack(fill="x", padx=20, pady=(0, 15))
+            
+            # Set version options based on database type
+            if choice == "MariaDB":
+                self.version_combo.configure(values=["10.11", "10.6", "10.5", "Latest"])
+            elif choice == "PostgreSQL":
+                self.version_combo.configure(values=["15", "14", "13", "Latest"])
+            
+            if hasattr(self.database_manager, 'get_service_status'):
+                status = self.database_manager.get_service_status(db_type_lower)
+                
+                if status.get('installed', False):
+                    if status.get('running', False):
+                        self.service_status_label.configure(
+                            text="✅ Service is installed and running",
+                            text_color="#10B981"
+                        )
+                    else:
+                        self.service_status_label.configure(
+                            text="⚠️ Service is installed but not running",
+                            text_color="#F59E0B"
+                        )
+                else:
+                    self.service_status_label.configure(
+                        text="❌ Service is not installed",
+                        text_color="#EF4444"
+                    )
+        else:
+            # Hide version selector for SQLite
+            self.version_frame.pack_forget()
+            self.service_status_label.configure(text="")
+    
+    def _browse_location(self):
+        """Browse for database location"""
+        from tkinter import filedialog
+        
+        filename = filedialog.asksaveasfilename(
+            title="Save Database As",
+            defaultextension=".db",
+            filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")]
+        )
+        
+        if filename:
+            self.location_entry.delete(0, "end")
+            self.location_entry.insert(0, filename)
+    
+    def create_database(self):
+        """Create the database"""
+        name = self.name_entry.get().strip()
+        db_type = self.type_combo.get()
+        location = self.location_entry.get().strip()
+        
+        if not name:
+            messagebox.showerror("Error", "Please enter a database name")
+            return
+        
+        # Validate database name (basic validation)
+        if not name.replace('_', '').isalnum():
+            messagebox.showerror("Error", 
+                "Database name can only contain letters, numbers, and underscores")
+            return
+        
+        # For non-SQLite databases, check service status
+        if db_type != "SQLite":
+            db_type_lower = db_type.lower()
+            if hasattr(self.database_manager, 'get_service_status'):
+                status = self.database_manager.get_service_status(db_type_lower)
+                if not status.get('installed', False):
+                    response = messagebox.askyesno(
+                        "Service Not Installed",
+                        f"{db_type} service is not installed. Do you want to continue anyway?\n\n"
+                        "Note: You won't be able to use the database until the service is installed."
+                    )
+                    if not response:
+                        return
+        
+        # Show creating message
+        self.status_text = ctk.CTkLabel(
+            self,
+            text="Creating database...",
+            font=ctk.CTkFont(size=11),
+            text_color="#3B82F6"
+        )
+        self.status_text.pack(pady=10)
+        self.update()
+        
+        try:
+            # Create database
+            success, message, db_info = self.database_manager.create_database(
+                name, db_type.lower(), location
+            )
+            
+            if success:
+                # Remove status message
+                self.status_text.destroy()
+                
+                # Show success with details
+                success_dialog = ctk.CTkToplevel(self)
+                success_dialog.title("Database Created Successfully")
+                success_dialog.geometry("500x400")
+                success_dialog.resizable(False, False)
+                
+                # Success message
+                ctk.CTkLabel(
+                    success_dialog,
+                    text="✅ Database Created Successfully",
+                    font=ctk.CTkFont(size=18, weight="bold"),
+                    text_color="#10B981"
+                ).pack(pady=20)
+                
+                # Database details
+                details_frame = ctk.CTkFrame(success_dialog)
+                details_frame.pack(fill="both", expand=True, padx=20, pady=10)
+                
+                details = [
+                    ("Name:", db_info.get('name', name)),
+                    ("Type:", db_info.get('type', db_type).upper()),
+                    ("Location:", db_info.get('location', 'Default location')),
+                    ("Created:", db_info.get('created', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
+                ]
+                
+                for label, value in details:
+                    frame = ctk.CTkFrame(details_frame, fg_color="transparent")
+                    frame.pack(fill="x", pady=5)
+                    
+                    ctk.CTkLabel(
+                        frame,
+                        text=label,
+                        font=ctk.CTkFont(size=12, weight="bold"),
+                        width=100
+                    ).pack(side="left")
+                    
+                    ctk.CTkLabel(
+                        frame,
+                        text=str(value),
+                        font=ctk.CTkFont(size=12)
+                    ).pack(side="left", padx=(10, 0))
+                
+                # Connection info for SQLite
+                if db_type == "SQLite":
+                    conn_frame = ctk.CTkFrame(details_frame, fg_color="transparent")
+                    conn_frame.pack(fill="x", pady=10)
+                    
+                    ctk.CTkLabel(
+                        conn_frame,
+                        text="Connection String:",
+                        font=ctk.CTkFont(size=12, weight="bold"),
+                        width=120
+                    ).pack(side="left")
+                    
+                    conn_string = db_info.get('connection_string', f'sqlite:///{db_info.get("location", "")}')
+                    ctk.CTkLabel(
+                        conn_frame,
+                        text=conn_string,
+                        font=ctk.CTkFont(size=10, family="Consolas"),
+                        text_color="gray"
+                    ).pack(side="left", padx=(10, 0))
+                
+                # Close button
+                ModernButton(
+                    success_dialog,
+                    text="Close",
+                    command=lambda: self._close_success(success_dialog),
+                    width=100
+                ).pack(pady=20)
+                
+                success_dialog.grab_set()
+                
+                self.result = True
+                
+            else:
+                # Remove status message
+                self.status_text.destroy()
+                messagebox.showerror("Error", f"Failed to create database: {message}")
+                
+        except Exception as e:
+            # Remove status message
+            if hasattr(self, 'status_text'):
+                self.status_text.destroy()
+            messagebox.showerror("Error", f"Failed to create database: {str(e)}")
+    
+    def _close_success(self, dialog):
+        """Close success dialog and this dialog"""
+        dialog.destroy()
+        self.destroy()
+    
+    def _center_window(self):
+        """Center the window on screen"""
+        self.update_idletasks()
+        
+        width = 500
+        height = 550
+        
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        
+        self.geometry(f"{width}x{height}+{x}+{y}")
+    
+    def on_close(self):
+        """Handle window close"""
+        self.destroy()
+
+
+class DatabaseInstanceDialog(ctk.CTkToplevel):
+    """Dialog for viewing database instance details"""
+    
+    def __init__(self, parent, database_manager, db_name: str):
+        super().__init__(parent)
+        
+        self.database_manager = database_manager
+        self.db_name = db_name
+        
+        self.title(f"Database: {db_name}")
+        self.geometry("600x500")
+        self.resizable(True, True)
+        
+        self._create_widgets()
+        self._load_database_details()
+        self._center_window()
+        
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+    
+    def _create_widgets(self):
+        """Create dialog widgets"""
+        
+        # Main frame
+        main_frame = ctk.CTkFrame(self)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Title
+        self.title_label = ctk.CTkLabel(
+            main_frame,
+            text=f"Database: {self.db_name}",
+            font=ctk.CTkFont(size=20, weight="bold")
+        )
+        self.title_label.pack(pady=(0, 20))
+        
+        # Details scrollable frame
+        scroll_frame = ctk.CTkScrollableFrame(main_frame)
+        scroll_frame.pack(fill="both", expand=True, pady=(0, 20))
+        
+        self.details_frame = scroll_frame
+        
+        # Buttons
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(side="bottom", fill="x")
+        
+        ModernButton(
+            button_frame,
+            text="Close",
+            command=self.on_close,
+            width=100
+        ).pack(side="right")
+    
+    def _load_database_details(self):
+        """Load database details"""
+        try:
+            # Get database details
+            instance = self.database_manager.get_database(self.db_name)
+            
+            if not instance:
+                messagebox.showerror("Error", f"Database '{self.db_name}' not found")
+                self.destroy()
+                return
+            
+            # Update title with status
+            accessible = instance.get('accessible', False)
+            status_text = "🟢 Online" if accessible else "🔴 Offline"
+            status_color = "#10B981" if accessible else "#EF4444"
+            
+            self.title_label.configure(
+                text=f"{self.db_name} - {status_text}",
+                text_color=status_color
+            )
+            
+            # Display details
+            details = [
+                ("Name:", instance.get('name', 'Unknown')),
+                ("Type:", instance.get('type', 'Unknown').upper()),
+                ("Location:", instance.get('location', 'N/A')),
+                ("Created:", instance.get('created', 'N/A')[:19]),
+                ("Size:", self._format_size(instance.get('size', 0))),
+                ("Tables:", str(instance.get('table_count', 0))),
+                ("Connection String:", instance.get('connection_string', 'N/A')),
+            ]
+            
+            for label, value in details:
+                frame = ctk.CTkFrame(self.details_frame, fg_color="transparent")
+                frame.pack(fill="x", pady=5)
+                
+                ctk.CTkLabel(
+                    frame,
+                    text=label,
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    width=140
+                ).pack(side="left")
+                
+                ctk.CTkLabel(
+                    frame,
+                    text=str(value),
+                    font=ctk.CTkFont(size=12)
+                ).pack(side="left")
+            
+            # Tables section
+            if instance.get('type', '').lower() == 'sqlite':
+                tables_frame = ctk.CTkFrame(self.details_frame)
+                tables_frame.pack(fill="x", pady=20)
+                
+                ctk.CTkLabel(
+                    tables_frame,
+                    text="Tables",
+                    font=ctk.CTkFont(size=14, weight="bold")
+                ).pack(anchor="w", padx=20, pady=(20, 10))
+                
+                # Get tables
+                tables = self.database_manager.get_tables(self.db_name)
+                
+                if tables:
+                    for table in tables:
+                        table_frame = ctk.CTkFrame(tables_frame, fg_color="transparent")
+                        table_frame.pack(fill="x", padx=20, pady=5)
+                        
+                        ctk.CTkLabel(
+                            table_frame,
+                            text=table.get('name', 'Unknown'),
+                            font=ctk.CTkFont(size=12, weight="bold"),
+                            width=100
+                        ).pack(side="left")
+                        
+                        ctk.CTkLabel(
+                            table_frame,
+                            text=f"Rows: {table.get('row_count', 0)}",
+                            font=ctk.CTkFont(size=12),
+                            text_color="gray"
+                        ).pack(side="left", padx=(20, 0))
+                else:
+                    ctk.CTkLabel(
+                        tables_frame,
+                        text="No tables found",
+                        font=ctk.CTkFont(size=12),
+                        text_color="gray"
+                    ).pack(padx=20, pady=10)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load database details: {str(e)}")
+    
+    def _format_size(self, size_bytes: int) -> str:
+        """Format size in bytes to human readable"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes/1024:.1f} KB"
+        else:
+            return f"{size_bytes/(1024*1024):.1f} MB"
+    
+    def _center_window(self):
+        """Center the window"""
+        self.update_idletasks()
+        
+        width = 600
+        height = 500
+        
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        
+        self.geometry(f"{width}x{height}+{x}+{y}")
+    
+    def on_close(self):
+        """Handle window close"""
+        self.destroy()
         
         
     
